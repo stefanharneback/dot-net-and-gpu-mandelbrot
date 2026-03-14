@@ -48,6 +48,8 @@ public sealed class MandelbrotApp : IDisposable
     private int _gridResolution = 512;
     private bool _adaptiveResolution = true;
 
+    public bool IsAdaptiveResolutionEnabled => _adaptiveResolution;
+
     // HUD
     private float _fps;
     private int _frameCount;
@@ -176,9 +178,15 @@ public sealed class MandelbrotApp : IDisposable
         _camera.Zoom(scroll.Y);
     }
 
-    private void OnKeyDown(IKeyboard keyboard, Key key, int scancode)
+    public void HandleExternalKeyDown(Key key)
     {
-        bool shift = keyboard.IsKeyPressed(Key.ShiftLeft) || keyboard.IsKeyPressed(Key.ShiftRight);
+        // Simple shim to allow HUD to pass keys back to logic
+        OnKeyDown(null!, key, 0);
+    }
+
+    private void OnKeyDown(IKeyboard? keyboard, Key key, int scancode)
+    {
+        bool shift = keyboard?.IsKeyPressed(Key.ShiftLeft) == true || keyboard?.IsKeyPressed(Key.ShiftRight) == true;
         double panAmount = shift ? 0.005 : 0.05;
         double zoomFactor = shift ? 1.05 : 1.3;
 
@@ -230,14 +238,13 @@ public sealed class MandelbrotApp : IDisposable
 
             // Iteration count
             case Key.I:
-                _compute.MaxIterations = Math.Min(_compute.MaxIterations * 2, 65536);
+                _compute.MaxIterations = _compute.MaxIterations < 1000 ? _compute.MaxIterations + 128 : _compute.MaxIterations * 2;
+                if (_compute.MaxIterations > 2_000_000) _compute.MaxIterations = 2_000_000;
                 _needsRecompute = true;
-                Console.WriteLine($"Max iterations: {_compute.MaxIterations}");
                 break;
             case Key.K:
-                _compute.MaxIterations = Math.Max(_compute.MaxIterations / 2, 32);
+                _compute.MaxIterations = _compute.MaxIterations < 1000 ? Math.Max(32, _compute.MaxIterations - 128) : _compute.MaxIterations / 2;
                 _needsRecompute = true;
-                Console.WriteLine($"Max iterations: {_compute.MaxIterations}");
                 break;
 
             // Color palette cycling
@@ -290,6 +297,18 @@ public sealed class MandelbrotApp : IDisposable
                 SetLocation(-0.7436447860, 0.1318252536, 1000000.0, 2000); break;
             case Key.Number6: // Extremely Deep Zoom
                 SetLocation(-0.7436447860, 0.1318252536, 100000000000.0, 10000); break;
+
+            // Precision cycling
+            case Key.M:
+                _compute.CurrentPrecisionMode = _compute.CurrentPrecisionMode switch
+                {
+                    PrecisionMode.Auto => PrecisionMode.ForceFP32,
+                    PrecisionMode.ForceFP32 => PrecisionMode.ForceFP64,
+                    _ => PrecisionMode.Auto
+                };
+                Console.WriteLine($"Precision Mode: {_compute.CurrentPrecisionMode}");
+                _needsRecompute = true;
+                break;
 
             // Reset view
             case Key.R:
@@ -416,7 +435,7 @@ public sealed class MandelbrotApp : IDisposable
         if (_fpsTimer >= 1.0)
         {
             _fps = (float)(_frameCount / _fpsTimer);
-            _window.Title = $"🌀 GPU Mandelbrot 3D Explorer — {_fps:F0} FPS";
+            _window.Title = $"🌀 Mandelbrot 3D — {_fps:F0} FPS | Zoom: {_compute.Zoom:0.##e+0}x | {_compute.PrecisionStatus} | Res: {_compute.Width}x{_compute.Height}";
             _frameCount = 0;
             _fpsTimer = 0;
         }
@@ -434,6 +453,7 @@ public sealed class MandelbrotApp : IDisposable
 
     private void CycleGridResolution()
     {
+        _adaptiveResolution = false; // Stop auto-pilot when user takes manual control
         _gridResolution = _gridResolution switch
         {
             128 => 256,
@@ -445,7 +465,6 @@ public sealed class MandelbrotApp : IDisposable
             _ => 128
         };
         _compute.Resize(_gridResolution, _gridResolution);
-        Console.WriteLine($"Grid resolution: {_gridResolution}x{_gridResolution}");
         _needsRecompute = true;
     }
 
@@ -453,11 +472,11 @@ public sealed class MandelbrotApp : IDisposable
     {
         // Increase detail as we zoom in
         double logZoom = Math.Log10(Math.Max(1.0, _compute.Zoom));
-        int targetRes = 512 + (int)(logZoom * 200);
-        targetRes = Math.Clamp(targetRes, 512, 2048);
+        int targetRes = 512 + (int)(logZoom * 300);
+        targetRes = Math.Clamp(targetRes, 512, 4096); 
 
         // Only resize if significantly different to prevent continuous recomputes
-        if (Math.Abs(targetRes - _gridResolution) > 64)
+        if (Math.Abs(targetRes - _gridResolution) > 128)
         {
             _gridResolution = targetRes;
             _compute.Resize(_gridResolution, _gridResolution);

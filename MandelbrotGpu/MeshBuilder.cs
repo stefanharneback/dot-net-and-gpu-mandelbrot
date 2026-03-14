@@ -39,8 +39,8 @@ public static class MeshBuilder
         float halfH = meshH / 2f;
         float scale = 2f / Math.Max(meshW, meshH); // Normalize to [-1, 1] range
 
-        // Build vertices
-        for (int gy = 0; gy < meshH; gy++)
+        // Build vertices in parallel
+        Parallel.For(0, meshH, gy =>
         {
             for (int gx = 0; gx < meshW; gx++)
             {
@@ -66,10 +66,10 @@ public static class MeshBuilder
                 vertices[vIdx + 7] = g;          // color g
                 vertices[vIdx + 8] = b;          // color b
             }
-        }
+        });
 
-        // Compute normals using central differences
-        for (int gy = 0; gy < meshH; gy++)
+        // Compute normals using central differences in parallel
+        Parallel.For(0, meshH, gy =>
         {
             for (int gx = 0; gx < meshW; gx++)
             {
@@ -101,7 +101,7 @@ public static class MeshBuilder
                 vertices[idx * FloatsPerVertex + 4] = ny;
                 vertices[idx * FloatsPerVertex + 5] = nz;
             }
-        }
+        });
 
         // Build triangle indices
         int iIdx = 0;
