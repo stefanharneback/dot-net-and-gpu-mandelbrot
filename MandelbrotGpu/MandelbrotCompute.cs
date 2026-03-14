@@ -1,6 +1,7 @@
 using ILGPU;
 using ILGPU.Algorithms;
 using ILGPU.Runtime;
+using System.Diagnostics;
 
 namespace MandelbrotGpu;
 
@@ -287,58 +288,72 @@ public sealed class MandelbrotCompute : IDisposable
     /// Computes the Mandelbrot set, automatically selecting the fastest
     /// kernel (FP32 or FP64) based on the current zoom level.
     /// </summary>
-    public float[] Compute()
+    public HeightFieldFrame Compute()
     {
         IsComputing = true;
         try
         {
+            long allocatedBefore = GC.GetTotalAllocatedBytes(false);
             int totalPixels = Width * Height;
 
-        // Re-use or allocate GPU output buffer
-        if (_deviceBuffer == null || _deviceBufferSize != totalPixels)
-        {
-            _deviceBuffer?.Dispose();
-            _deviceBuffer     = _accelerator.Allocate1D<float>(totalPixels);
-            _deviceBufferSize = totalPixels;
-            _cpuBuffer = new float[totalPixels];
-        }
+            // Re-use or allocate GPU output buffer
+            if (_deviceBuffer == null || _deviceBufferSize != totalPixels)
+            {
+                _deviceBuffer?.Dispose();
+                _deviceBuffer     = _accelerator.Allocate1D<float>(totalPixels);
+                _deviceBufferSize = totalPixels;
+                _cpuBuffer = new float[totalPixels];
+            }
 
-        double aspectRatio = (double)Width / Height;
-        double rangeY = 2.0 / Zoom;
-        double rangeX = rangeY * aspectRatio;
+            double aspectRatio = (double)Width / Height;
+            double rangeY = 2.0 / Zoom;
+            double rangeX = rangeY * aspectRatio;
 
-        double xMin = CenterX - rangeX;
-        double xMax = CenterX + rangeX;
-        double yMin = CenterY - rangeY;
-        double yMax = CenterY + rangeY;
+            double xMin = CenterX - rangeX;
+            double xMax = CenterX + rangeX;
+            double yMin = CenterY - rangeY;
+            double yMax = CenterY + rangeY;
 
-        // --- Optimization 3: Precision Selection ---
-        bool useF32 = CurrentPrecisionMode switch
-        {
-            PrecisionMode.ForceFP32 => true,
-            PrecisionMode.ForceFP64 => false,
-            _ => Zoom < FloatPrecisionZoomLimit
-        };
+            // --- Optimization 3: Precision Selection ---
+            bool useF32 = CurrentPrecisionMode switch
+            {
+                PrecisionMode.ForceFP32 => true,
+                PrecisionMode.ForceFP64 => false,
+                _ => Zoom < FloatPrecisionZoomLimit
+            };
 
-        if (useF32)
-        {
-            _kernelF32(totalPixels, _deviceBuffer.View,
-                Width, Height,
-                (float)xMin, (float)yMin, (float)xMax, (float)yMax,
-                MaxIterations);
-        }
-        else
-        {
-            _kernelF64(totalPixels, _deviceBuffer.View,
-                Width, Height,
-                xMin, yMin, xMax, yMax,
-                MaxIterations);
-        }
+            long dispatchStart = Stopwatch.GetTimestamp();
+            if (useF32)
+            {
+                _kernelF32(totalPixels, _deviceBuffer.View,
+                    Width, Height,
+                    (float)xMin, (float)yMin, (float)xMax, (float)yMax,
+                    MaxIterations);
+            }
+            else
+            {
+                _kernelF64(totalPixels, _deviceBuffer.View,
+                    Width, Height,
+                    xMin, yMin, xMax, yMax,
+                    MaxIterations);
+            }
 
+            long synchronizeStart = Stopwatch.GetTimestamp();
             _accelerator.Synchronize();
+            long readbackStart = Stopwatch.GetTimestamp();
 
             _deviceBuffer.CopyToCPU(_cpuBuffer);
-            return _cpuBuffer!;
+            long end = Stopwatch.GetTimestamp();
+
+            return new HeightFieldFrame(
+                _cpuBuffer!,
+                Width,
+                Height,
+                PrecisionStatus,
+                Stopwatch.GetElapsedTime(dispatchStart, synchronizeStart).TotalMilliseconds,
+                Stopwatch.GetElapsedTime(synchronizeStart, readbackStart).TotalMilliseconds,
+                Stopwatch.GetElapsedTime(readbackStart, end).TotalMilliseconds,
+                GC.GetTotalAllocatedBytes(false) - allocatedBefore);
         }
         finally
         {

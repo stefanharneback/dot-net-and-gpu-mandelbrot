@@ -6,6 +6,15 @@ namespace MandelbrotGpu;
 /// </summary>
 public static class ColorPalette
 {
+    public static float[] GeneratePalette(int paletteIndex, int size = 1024) => paletteIndex switch
+    {
+        0 => GenerateVibrantPalette(size),
+        1 => GenerateFirePalette(size),
+        2 => GenerateOceanPalette(size),
+        3 => GenerateNeonPalette(size),
+        _ => GenerateVibrantPalette(size)
+    };
+
     /// <summary>
     /// Generate a smooth, vivid color palette using cosine gradients.
     /// Returns float[size * 3] as RGB triplets in [0..1].

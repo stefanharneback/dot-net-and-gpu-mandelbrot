@@ -1,10 +1,11 @@
+using System.Diagnostics;
 using System.Numerics;
+using System.Threading;
+using System.Windows;
 using Silk.NET.Input;
 using Silk.NET.Maths;
 using Silk.NET.OpenGL;
 using Silk.NET.Windowing;
-using System.Threading;
-using System.Windows;
 
 namespace MandelbrotGpu;
 
@@ -14,55 +15,97 @@ namespace MandelbrotGpu;
 /// </summary>
 public sealed class MandelbrotApp : IDisposable
 {
+    private const int MaxWindowMsaaSamples = 4;
+    private const int LargeIterationThreshold = 1000;
+    private const int IterationLinearStep = 128;
+    private const int MaxIterationLimit = 2_000_000;
+
+    private readonly ResolutionTier[] _resolutionTiers =
+    [
+        new(512, 384),
+        new(768, 512),
+        new(1024, 768),
+        new(1536, 1024),
+        new(2048, 1536),
+        new(3072, 2048),
+        new(4096, 2048)
+    ];
+
+    private readonly Camera _camera = new();
+    private readonly string[] _paletteNames = ["Vibrant", "Fire", "Ocean", "Neon"];
+    private readonly object _settingsWindowLock = new();
+
     private IWindow _window = null!;
     private GL _gl = null!;
     private IInputContext _input = null!;
-
-    // OpenGL resources
-    private uint _shaderProgram;
-    private uint _vao, _vbo, _ebo;
-    private uint _gridShaderProgram;
-    private uint _gridVao, _gridVbo;
-    private int _indexCount;
-    private int _gridVertexCount;
-
-
-    // Components
     private MandelbrotCompute _compute = null!;
-    private readonly Camera _camera = new();
+    private HeightFieldRenderer _terrainRenderer = null!;
 
-    // Color palette state
-    private readonly string[] _paletteNames = ["Vibrant", "Fire", "Ocean", "Neon"];
-    private int _currentPalette;
+    private uint _terrainShaderProgram;
+    private uint _gridShaderProgram;
+    private uint _gridVao;
+    private uint _gridVbo;
+    private int _gridVertexCount;
+    private int _gridViewProjectionLocation;
+
+    private PerformanceSettings _performanceSettings;
+    private int _resolutionTierIndex;
+    private PerformanceMetrics _latestMetrics = PerformanceMetrics.Empty;
+    private HeightFieldFrame? _currentFrame;
+
     private float[] _palette = null!;
+    private int _currentPalette;
+    private float _heightScale = 0.6f;
+    private bool _needsRecompute = true;
+    private bool _paletteDirty = true;
+    private bool _wireframeMode;
 
-    // Mouse state
     private bool _leftMouseDown;
     private bool _middleMouseDown;
     private Vector2 _lastMousePos;
 
-    // Mandelbrot navigation state
-    private float _heightScale = 0.6f;
-    private bool _needsRecompute = true;
-    private bool _wireframeMode;
-    private int _gridResolution = 512;
-    private bool _adaptiveResolution = true;
-
-    public bool IsAdaptiveResolutionEnabled => _adaptiveResolution;
-
-    // HUD
     private float _fps;
     private int _frameCount;
     private double _fpsTimer;
+
+    private SettingsHUD? _settingsHud;
+    private Thread? _settingsThread;
+    private volatile bool _isHudStarting;
+
+    public MandelbrotApp()
+    {
+        _performanceSettings = PerformanceSettings.Create(PerformanceProfile.Latency);
+        _resolutionTierIndex = GetDefaultTierIndex(_performanceSettings.Profile);
+    }
+
+    public PerformanceSettings CurrentPerformanceSettings => _performanceSettings;
+
+    public PerformanceMetrics LatestPerformanceMetrics => _latestMetrics;
+
+    public bool AdaptiveResolutionEnabled => _performanceSettings.AdaptiveResolutionEnabled;
+
+    public string CurrentPaletteName => _paletteNames[_currentPalette];
+
+    public float HeightScale => _heightScale;
+
+    public float FPS => _fps;
+
+    public int RenderMeshResolution => _terrainRenderer?.RenderMeshResolution ?? _performanceSettings.RenderMeshResolution;
+
+    public bool GridVisible => _performanceSettings.ShowGrid;
+
+    public bool WireframeMode => _wireframeMode;
+
+    public PrecisionMode CurrentPrecisionMode => _compute?.CurrentPrecisionMode ?? PrecisionMode.Auto;
 
     public void Run()
     {
         var options = WindowOptions.Default;
         options.Size = new Vector2D<int>(1600, 900);
-        options.Title = "🌀 GPU Mandelbrot 3D Explorer — .NET 10 + ILGPU + OpenGL";
-        options.VSync = true;
+        options.Title = "GPU Mandelbrot 3D Explorer";
+        options.VSync = _performanceSettings.VSyncEnabled;
         options.PreferredDepthBufferBits = 24;
-        options.Samples = 4; // MSAA
+        options.Samples = MaxWindowMsaaSamples;
 
         _window = Silk.NET.Windowing.Window.Create(options);
         _window.Load += OnLoad;
@@ -79,54 +122,30 @@ public sealed class MandelbrotApp : IDisposable
         _gl = _window.CreateOpenGL();
         _input = _window.CreateInput();
 
-        // Configure OpenGL
         _gl.Enable(EnableCap.DepthTest);
-        _gl.Enable(EnableCap.Multisample);
         _gl.Enable(EnableCap.Blend);
         _gl.BlendFunc(BlendingFactor.SrcAlpha, BlendingFactor.OneMinusSrcAlpha);
-        _gl.ClearColor(0.02f, 0.02f, 0.05f, 1.0f); // Dark background
+        _gl.ClearColor(0.02f, 0.02f, 0.05f, 1.0f);
 
-        // Initialize compute
-        _compute = new MandelbrotCompute(_gridResolution, _gridResolution);
+        _compute = new MandelbrotCompute(_performanceSettings.ComputeResolution, _performanceSettings.ComputeResolution);
+        _palette = ColorPalette.GeneratePalette(_currentPalette);
 
-        // Initialize palette
-        _palette = ColorPalette.GenerateVibrantPalette();
-
-        // Create shaders
-        _shaderProgram = CreateShaderProgram(Shaders.VertexShader, Shaders.FragmentShader);
+        _terrainShaderProgram = CreateShaderProgram(Shaders.TerrainVertexShader, Shaders.TerrainFragmentShader);
         _gridShaderProgram = CreateShaderProgram(Shaders.GridVertexShader, Shaders.GridFragmentShader);
+        _gridViewProjectionLocation = _gl.GetUniformLocation(_gridShaderProgram, "uViewProjection");
 
-        // Create mesh VAO/VBO/EBO
-        _vao = _gl.GenVertexArray();
-        _vbo = _gl.GenBuffer();
-        _ebo = _gl.GenBuffer();
+        _terrainRenderer = new HeightFieldRenderer(_gl, _terrainShaderProgram);
+        _terrainRenderer.SetRenderMeshResolution(_performanceSettings.RenderMeshResolution);
+        _terrainRenderer.UploadPalette(_palette);
+        _paletteDirty = false;
 
-        // Create grid overlay
         CreateGridOverlay();
-
-        // Setup input handlers
         SetupInput();
-
-        // Initial compute
+        ApplyRuntimePerformanceSettings(logToConsole: false);
         RecomputeMandelbrot();
-
-        // Start the detached settings HUD Window
-        StartSettingsWindow();
+        UpdateHudVisibility();
 
         PrintControls();
-    }
-
-    private void StartSettingsWindow()
-    {
-        // Must run WPF in a separate STA thread since Silk.NET takes the main thread
-        var thread = new Thread(() =>
-        {
-            var app = new Application();
-            app.Run(new SettingsHUD(this, _compute));
-        });
-        thread.SetApartmentState(ApartmentState.STA); // Essential for WPF
-        thread.IsBackground = true; // Close when main app closes
-        thread.Start();
     }
 
     private void SetupInput()
@@ -140,22 +159,27 @@ public sealed class MandelbrotApp : IDisposable
         }
 
         foreach (var keyboard in _input.Keyboards)
-        {
             keyboard.KeyDown += OnKeyDown;
-        }
     }
 
     private void OnMouseDown(IMouse mouse, MouseButton button)
     {
-        if (button == MouseButton.Left) _leftMouseDown = true;
-        if (button == MouseButton.Middle) _middleMouseDown = true;
+        if (button == MouseButton.Left)
+            _leftMouseDown = true;
+
+        if (button == MouseButton.Middle)
+            _middleMouseDown = true;
+
         _lastMousePos = mouse.Position;
     }
 
     private void OnMouseUp(IMouse mouse, MouseButton button)
     {
-        if (button == MouseButton.Left) _leftMouseDown = false;
-        if (button == MouseButton.Middle) _middleMouseDown = false;
+        if (button == MouseButton.Left)
+            _leftMouseDown = false;
+
+        if (button == MouseButton.Middle)
+            _middleMouseDown = false;
     }
 
     private void OnMouseMove(IMouse mouse, Vector2 position)
@@ -164,13 +188,9 @@ public sealed class MandelbrotApp : IDisposable
         _lastMousePos = position;
 
         if (_leftMouseDown)
-        {
             _camera.Orbit(delta.X, -delta.Y);
-        }
         else if (_middleMouseDown)
-        {
             _camera.Pan(delta.X, delta.Y);
-        }
     }
 
     private void OnMouseScroll(IMouse mouse, ScrollWheel scroll)
@@ -178,213 +198,516 @@ public sealed class MandelbrotApp : IDisposable
         _camera.Zoom(scroll.Y);
     }
 
-    public void HandleExternalKeyDown(Key key)
+    private void OnKeyDown(IKeyboard keyboard, Key key, int scancode)
     {
-        // Simple shim to allow HUD to pass keys back to logic
-        OnKeyDown(null!, key, 0);
+        bool shift = keyboard.IsKeyPressed(Key.ShiftLeft) || keyboard.IsKeyPressed(Key.ShiftRight);
+        HandleKey(key, shift);
     }
 
-    private void OnKeyDown(IKeyboard? keyboard, Key key, int scancode)
+    public void HandleExternalKeyDown(Key key, bool shiftPressed)
     {
-        bool shift = keyboard?.IsKeyPressed(Key.ShiftLeft) == true || keyboard?.IsKeyPressed(Key.ShiftRight) == true;
+        HandleKey(key, shiftPressed);
+    }
+
+    private void HandleKey(Key key, bool shift)
+    {
         double panAmount = shift ? 0.005 : 0.05;
         double zoomFactor = shift ? 1.05 : 1.3;
 
         switch (key)
         {
-            // Mandelbrot navigation
             case Key.Left:
             case Key.A:
                 _compute.CenterX -= panAmount / _compute.Zoom;
-                _needsRecompute = true;
+                MarkDirty();
                 break;
             case Key.Right:
             case Key.D:
                 _compute.CenterX += panAmount / _compute.Zoom;
-                _needsRecompute = true;
+                MarkDirty();
                 break;
             case Key.Up:
             case Key.W:
                 _compute.CenterY += panAmount / _compute.Zoom;
-                _needsRecompute = true;
+                MarkDirty();
                 break;
             case Key.Down:
             case Key.S:
                 _compute.CenterY -= panAmount / _compute.Zoom;
-                _needsRecompute = true;
+                MarkDirty();
                 break;
 
-            // Zoom into Mandelbrot set
-            case Key.Equal: // +
+            case Key.Equal:
             case Key.KeypadAdd:
                 _compute.Zoom *= zoomFactor;
-                _needsRecompute = true;
+                MarkDirty();
                 break;
             case Key.Minus:
             case Key.KeypadSubtract:
                 _compute.Zoom /= zoomFactor;
-                _needsRecompute = true;
+                MarkDirty();
                 break;
 
-            // Height scale
             case Key.PageUp:
                 _heightScale = Math.Min(_heightScale + 0.1f, 3.0f);
-                _needsRecompute = true;
+                Console.WriteLine($"Height scale: {_heightScale:F2}");
                 break;
             case Key.PageDown:
                 _heightScale = Math.Max(_heightScale - 0.1f, 0.05f);
-                _needsRecompute = true;
+                Console.WriteLine($"Height scale: {_heightScale:F2}");
                 break;
 
-            // Iteration count
             case Key.I:
-                _compute.MaxIterations = _compute.MaxIterations < 1000 ? _compute.MaxIterations + 128 : _compute.MaxIterations * 2;
-                if (_compute.MaxIterations > 2_000_000) _compute.MaxIterations = 2_000_000;
-                _needsRecompute = true;
+                _compute.MaxIterations = _compute.MaxIterations < LargeIterationThreshold
+                    ? Math.Min(_compute.MaxIterations + IterationLinearStep, MaxIterationLimit)
+                    : Math.Min(_compute.MaxIterations * 2, MaxIterationLimit);
+                MarkDirty();
+                Console.WriteLine($"Max iterations: {_compute.MaxIterations:N0}");
                 break;
             case Key.K:
-                _compute.MaxIterations = _compute.MaxIterations < 1000 ? Math.Max(32, _compute.MaxIterations - 128) : _compute.MaxIterations / 2;
-                _needsRecompute = true;
+                _compute.MaxIterations = _compute.MaxIterations <= LargeIterationThreshold
+                    ? Math.Max(32, _compute.MaxIterations - IterationLinearStep)
+                    : Math.Max(LargeIterationThreshold, _compute.MaxIterations / 2);
+                MarkDirty();
+                Console.WriteLine($"Max iterations: {_compute.MaxIterations:N0}");
                 break;
 
-            // Color palette cycling
             case Key.C:
                 _currentPalette = (_currentPalette + 1) % _paletteNames.Length;
-                _palette = _currentPalette switch
-                {
-                    0 => ColorPalette.GenerateVibrantPalette(),
-                    1 => ColorPalette.GenerateFirePalette(),
-                    2 => ColorPalette.GenerateOceanPalette(),
-                    3 => ColorPalette.GenerateNeonPalette(),
-                    _ => _palette
-                };
+                _palette = ColorPalette.GeneratePalette(_currentPalette);
+                _paletteDirty = true;
                 Console.WriteLine($"Palette: {_paletteNames[_currentPalette]}");
-                _needsRecompute = true;
                 break;
 
-            // Wireframe toggle
             case Key.F:
                 _wireframeMode = !_wireframeMode;
                 Console.WriteLine($"Wireframe: {(_wireframeMode ? "ON" : "OFF")}");
                 break;
 
-            // Grid resolution manual cycle
             case Key.G:
-                CycleGridResolution();
+                CycleResolutionTier();
                 break;
 
-            // Toggle Adaptive Resolution
-            case Key.O:
-                _adaptiveResolution = !_adaptiveResolution;
-                Console.WriteLine($"Adaptive Resolution: {(_adaptiveResolution ? "ON" : "OFF")}");
+            case Key.H:
+                FocusSettingsWindow();
                 break;
 
-            // Print coordinates
-            case Key.P:
-                Console.WriteLine($"Coords: X: {_compute.CenterX}, Y: {_compute.CenterY} | Zoom: {_compute.Zoom} | Iter: {_compute.MaxIterations}");
+            case Key.L:
+                CycleShadingMode();
                 break;
 
-            // Presets
-            case Key.Number1: // Default
-                SetLocation(-0.5, 0.0, 1.0, 256); break;
-            case Key.Number2: // Seahorse Valley
-                SetLocation(-0.743643887037151, 0.13182590420533, 10000.0, 1000); break;
-            case Key.Number3: // Elephant Valley
-                SetLocation(0.27322626, 0.595153338, 2000.0, 1000); break;
-            case Key.Number4: // Triple Spiral
-                SetLocation(-0.088, 0.654, 50.0, 500); break;
-            case Key.Number5: // Deep Zoom
-                SetLocation(-0.7436447860, 0.1318252536, 1000000.0, 2000); break;
-            case Key.Number6: // Extremely Deep Zoom
-                SetLocation(-0.7436447860, 0.1318252536, 100000000000.0, 10000); break;
-
-            // Precision cycling
             case Key.M:
-                _compute.CurrentPrecisionMode = _compute.CurrentPrecisionMode switch
-                {
-                    PrecisionMode.Auto => PrecisionMode.ForceFP32,
-                    PrecisionMode.ForceFP32 => PrecisionMode.ForceFP64,
-                    _ => PrecisionMode.Auto
-                };
-                Console.WriteLine($"Precision Mode: {_compute.CurrentPrecisionMode}");
-                _needsRecompute = true;
+                CyclePrecisionMode();
                 break;
 
-            // Reset view
+            case Key.N:
+                CyclePerformanceProfile();
+                break;
+
+            case Key.O:
+                SetAdaptiveResolution(!_performanceSettings.AdaptiveResolutionEnabled);
+                break;
+
+            case Key.P:
+                Console.WriteLine(
+                    $"Coords: X: {_compute.CenterX}, Y: {_compute.CenterY} | Zoom: {_compute.Zoom} | Iter: {_compute.MaxIterations} | " +
+                    $"Profile: {_performanceSettings.Profile} | Compute: {_compute.Width} | Render: {RenderMeshResolution}");
+                break;
+
+            case Key.V:
+                SetVSyncEnabled(!_performanceSettings.VSyncEnabled);
+                break;
+
+            case Key.Number1:
+                SetLocation(-0.5, 0.0, 1.0, 256);
+                break;
+            case Key.Number2:
+                SetLocation(-0.743643887037151, 0.13182590420533, 10000.0, 1000);
+                break;
+            case Key.Number3:
+                SetLocation(0.27322626, 0.595153338, 2000.0, 1000);
+                break;
+            case Key.Number4:
+                SetLocation(-0.088, 0.654, 50.0, 500);
+                break;
+            case Key.Number5:
+                SetLocation(-0.7436447860, 0.1318252536, 1000000.0, 2000);
+                break;
+            case Key.Number6:
+                SetLocation(-0.7436447860, 0.1318252536, 100000000000.0, 10000);
+                break;
+
             case Key.R:
                 _compute.CenterX = -0.5;
                 _compute.CenterY = 0.0;
                 _compute.Zoom = 1.0;
                 _compute.MaxIterations = 256;
                 _heightScale = 0.6f;
-                _needsRecompute = true;
+                MarkDirty();
                 Console.WriteLine("View reset");
                 break;
 
-            // Escape to close
             case Key.Escape:
                 _window.Close();
                 break;
         }
     }
 
-    private void SetLocation(double cx, double cy, double zoom, int maxIter)
+    private void SetLocation(double centerX, double centerY, double zoom, int maxIterations)
     {
-        _compute.CenterX = cx;
-        _compute.CenterY = cy;
+        _compute.CenterX = centerX;
+        _compute.CenterY = centerY;
         _compute.Zoom = zoom;
-        _compute.MaxIterations = maxIter;
-        _needsRecompute = true;
-        Console.WriteLine($"Location set -> X: {cx}, Y: {cy} | Zoom: {zoom}x | Iter: {maxIter}");
+        _compute.MaxIterations = maxIterations;
+        MarkDirty();
+        Console.WriteLine($"Location set -> X: {centerX}, Y: {centerY} | Zoom: {zoom}x | Iter: {maxIterations}");
+    }
+
+    private void OnUpdate(double deltaTime)
+    {
+        _frameCount++;
+        _fpsTimer += deltaTime;
+        if (_fpsTimer >= 1.0)
+        {
+            _fps = (float)(_frameCount / _fpsTimer);
+            _window.Title =
+                $"Mandelbrot 3D | {_fps:F0} FPS | {_performanceSettings.Profile} | Compute {_compute.Width} | Render {RenderMeshResolution} | " +
+                $"{(_currentFrame?.PrecisionMode ?? _compute.PrecisionStatus)} | Latency {_latestMetrics.InteractionLatencyMs:F1} ms";
+            _frameCount = 0;
+            _fpsTimer = 0;
+        }
+
+        if (_paletteDirty)
+        {
+            _terrainRenderer.UploadPalette(_palette);
+            _paletteDirty = false;
+        }
+
+        if (_performanceSettings.AdaptiveResolutionEnabled)
+            UpdateAdaptiveResolution();
+
+        if (_needsRecompute)
+            RecomputeMandelbrot();
+    }
+
+    private void OnRender(double deltaTime)
+    {
+        _gl.Clear(ClearBufferMask.ColorBufferBit | ClearBufferMask.DepthBufferBit);
+
+        if (_currentFrame == null)
+            return;
+
+        long drawStart = Stopwatch.GetTimestamp();
+
+        float aspect = (float)_window.Size.X / _window.Size.Y;
+        Matrix4x4 view = _camera.GetViewMatrix();
+        Matrix4x4 projection = Camera.GetProjectionMatrix(aspect);
+        Matrix4x4 model = Matrix4x4.Identity;
+
+        _terrainRenderer.Render(
+            model,
+            view,
+            projection,
+            Vector3.Normalize(new Vector3(0.5f, 1.0f, 0.3f)),
+            _camera.Position,
+            _currentFrame,
+            _heightScale,
+            _performanceSettings.ShadingMode,
+            _wireframeMode);
+
+        if (_performanceSettings.ShowGrid)
+        {
+            _gl.UseProgram(_gridShaderProgram);
+            Matrix4x4 viewProjection = view * projection;
+            SetUniformMatrix4(_gridViewProjectionLocation, viewProjection);
+
+            _gl.BindVertexArray(_gridVao);
+            _gl.DrawArrays(PrimitiveType.Lines, 0, (uint)_gridVertexCount);
+        }
+
+        _latestMetrics = _latestMetrics with
+        {
+            DrawMs = Stopwatch.GetElapsedTime(drawStart).TotalMilliseconds
+        };
     }
 
     private void RecomputeMandelbrot()
     {
-        float[] data = _compute.Compute();
-        var (vertices, indices) = MeshBuilder.BuildTerrainMesh(data, _compute.Width, _compute.Height, _palette, _heightScale);
+        long recomputeStart = Stopwatch.GetTimestamp();
+        long allocatedBefore = GC.GetTotalAllocatedBytes(false);
 
-        _indexCount = indices.Length;
-        UploadMesh(vertices, indices);
+        HeightFieldFrame frame = _compute.Compute();
+        _terrainRenderer.UploadHeightField(frame);
+        _currentFrame = frame;
+
+        _latestMetrics = _latestMetrics with
+        {
+            KernelDispatchMs = frame.KernelDispatchMs,
+            GpuSynchronizeMs = frame.GpuSynchronizeMs,
+            ReadbackMs = frame.ReadbackMs,
+            TextureUploadMs = frame.TextureUploadMs,
+            GridBuildMs = _terrainRenderer.LastGridBuildMs,
+            InteractionLatencyMs = Stopwatch.GetElapsedTime(recomputeStart).TotalMilliseconds,
+            ManagedAllocatedBytes = GC.GetTotalAllocatedBytes(false) - allocatedBefore
+        };
 
         _needsRecompute = false;
     }
 
-    private unsafe void UploadMesh(float[] vertices, uint[] indices)
+    private void CyclePerformanceProfile()
     {
-        _gl.BindVertexArray(_vao);
-
-        _gl.BindBuffer(BufferTargetARB.ArrayBuffer, _vbo);
-        fixed (float* v = vertices)
+        PerformanceProfile nextProfile = _performanceSettings.Profile switch
         {
-            _gl.BufferData(BufferTargetARB.ArrayBuffer, (nuint)(vertices.Length * sizeof(float)), v, BufferUsageARB.DynamicDraw);
+            PerformanceProfile.Latency => PerformanceProfile.Balanced,
+            PerformanceProfile.Balanced => PerformanceProfile.Quality,
+            PerformanceProfile.Quality => PerformanceProfile.Screenshot,
+            _ => PerformanceProfile.Latency
+        };
+
+        ApplyPerformanceProfile(nextProfile);
+    }
+
+    private void CyclePrecisionMode()
+    {
+        _compute.CurrentPrecisionMode = _compute.CurrentPrecisionMode switch
+        {
+            PrecisionMode.Auto => PrecisionMode.ForceFP32,
+            PrecisionMode.ForceFP32 => PrecisionMode.ForceFP64,
+            _ => PrecisionMode.Auto
+        };
+
+        MarkDirty();
+        Console.WriteLine($"Precision Mode: {_compute.CurrentPrecisionMode}");
+    }
+
+    private void ApplyPerformanceProfile(PerformanceProfile profile)
+    {
+        _performanceSettings = PerformanceSettings.Create(profile);
+        _resolutionTierIndex = GetDefaultTierIndex(profile);
+        ApplyResolutionTier(_resolutionTierIndex);
+        ApplyRuntimePerformanceSettings(logToConsole: false);
+
+        Console.WriteLine(
+            $"Profile: {profile} | Compute: {_performanceSettings.ComputeResolution} | Render: {_performanceSettings.RenderMeshResolution} | " +
+            $"Shading: {_performanceSettings.ShadingMode} | HUD: {(_performanceSettings.HudEnabled ? "ON" : "OFF")}");
+    }
+
+    private void CycleResolutionTier()
+    {
+        if (_performanceSettings.AdaptiveResolutionEnabled)
+            _performanceSettings = _performanceSettings with { AdaptiveResolutionEnabled = false };
+
+        var bounds = GetTierBounds(_performanceSettings.Profile);
+        int nextTier = _resolutionTierIndex + 1;
+        if (nextTier > bounds.Max)
+            nextTier = bounds.Min;
+
+        ApplyResolutionTier(nextTier);
+        Console.WriteLine(
+            $"Adaptive Resolution: OFF | Compute: {_performanceSettings.ComputeResolution} | Render: {_performanceSettings.RenderMeshResolution}");
+    }
+
+    private void ApplyResolutionTier(int tierIndex)
+    {
+        ResolutionTier tier = _resolutionTiers[tierIndex];
+        bool computeChanged = _compute != null &&
+            (_compute.Width != tier.ComputeResolution || _compute.Height != tier.ComputeResolution);
+        bool renderChanged = _terrainRenderer != null &&
+            _terrainRenderer.RenderMeshResolution != tier.RenderMeshResolution;
+
+        _resolutionTierIndex = tierIndex;
+        _performanceSettings = _performanceSettings with
+        {
+            ComputeResolution = tier.ComputeResolution,
+            RenderMeshResolution = tier.RenderMeshResolution
+        };
+
+        if (renderChanged)
+            _terrainRenderer!.SetRenderMeshResolution(tier.RenderMeshResolution);
+
+        if (computeChanged)
+        {
+            _compute!.Resize(tier.ComputeResolution, tier.ComputeResolution);
+            MarkDirty();
+        }
+    }
+
+    private void UpdateAdaptiveResolution(bool force = false)
+    {
+        if (_performanceSettings.Profile == PerformanceProfile.Screenshot)
+            return;
+
+        var bounds = GetTierBounds(_performanceSettings.Profile);
+        if (bounds.Max <= bounds.Default)
+            return;
+
+        double logZoom = Math.Log10(Math.Max(1.0, _compute.Zoom));
+        double zoomFactor = Math.Clamp(logZoom / 3.0, 0.0, 1.0);
+        int desiredTier = bounds.Default + (int)Math.Round((bounds.Max - bounds.Default) * zoomFactor);
+        desiredTier = Math.Clamp(desiredTier, bounds.Min, bounds.Max);
+
+        if (desiredTier == _resolutionTierIndex)
+            return;
+
+        int currentCompute = _performanceSettings.ComputeResolution;
+        int desiredCompute = _resolutionTiers[desiredTier].ComputeResolution;
+        bool hysteresisTriggered = desiredCompute >= currentCompute * 1.25 || desiredCompute <= currentCompute * 0.75;
+        if (force || hysteresisTriggered)
+        {
+            ApplyResolutionTier(desiredTier);
+            Console.WriteLine($"Adaptive resolution -> Compute: {_performanceSettings.ComputeResolution} | Render: {_performanceSettings.RenderMeshResolution}");
+        }
+    }
+
+    private void SetAdaptiveResolution(bool enabled)
+    {
+        _performanceSettings = _performanceSettings with { AdaptiveResolutionEnabled = enabled };
+        Console.WriteLine($"Adaptive Resolution: {(enabled ? "ON" : "OFF")}");
+
+        if (enabled)
+            UpdateAdaptiveResolution(force: true);
+    }
+
+    private void CycleShadingMode()
+    {
+        ShadingMode nextMode = _performanceSettings.ShadingMode == ShadingMode.Full
+            ? ShadingMode.Simplified
+            : ShadingMode.Full;
+
+        _performanceSettings = _performanceSettings with { ShadingMode = nextMode };
+        Console.WriteLine($"Shading: {nextMode}");
+    }
+
+    private void SetVSyncEnabled(bool enabled)
+    {
+        _performanceSettings = _performanceSettings with { VSyncEnabled = enabled };
+        if (_window != null)
+            _window.VSync = enabled;
+
+        Console.WriteLine($"VSync: {(enabled ? "ON" : "OFF")}");
+    }
+
+    private void SetHudEnabled(bool enabled)
+    {
+        _performanceSettings = _performanceSettings with { HudEnabled = enabled };
+        UpdateHudVisibility();
+        Console.WriteLine($"HUD: {(enabled ? "ON" : "OFF")}");
+    }
+
+    private void ApplyRuntimePerformanceSettings(bool logToConsole = true)
+    {
+        if (_window != null)
+            _window.VSync = _performanceSettings.VSyncEnabled;
+
+        if (_gl != null)
+        {
+            if (_performanceSettings.MsaaSamples > 0)
+                _gl.Enable(EnableCap.Multisample);
+            else
+                _gl.Disable(EnableCap.Multisample);
         }
 
-        _gl.BindBuffer(BufferTargetARB.ElementArrayBuffer, _ebo);
-        fixed (uint* i = indices)
+        UpdateHudVisibility();
+
+        if (logToConsole)
         {
-            _gl.BufferData(BufferTargetARB.ElementArrayBuffer, (nuint)(indices.Length * sizeof(uint)), i, BufferUsageARB.DynamicDraw);
+            Console.WriteLine(
+                $"Runtime settings -> VSync: {(_performanceSettings.VSyncEnabled ? "ON" : "OFF")} | " +
+                $"MSAA: {(_performanceSettings.MsaaSamples > 0 ? $"{_performanceSettings.MsaaSamples}x" : "OFF")} | " +
+                $"Grid: {(_performanceSettings.ShowGrid ? "ON" : "OFF")}");
         }
+    }
 
-        int stride = MeshBuilder.FloatsPerVertex * sizeof(float);
+    private void UpdateHudVisibility()
+    {
+        if (_compute == null)
+            return;
 
-        // Position attribute (location = 0)
-        _gl.EnableVertexAttribArray(0);
-        _gl.VertexAttribPointer(0, 3, VertexAttribPointerType.Float, false, (uint)stride, (void*)0);
+        if (_performanceSettings.HudEnabled)
+            ShowSettingsWindow();
+        else
+            CloseSettingsWindow();
+    }
 
-        // Normal attribute (location = 1)
-        _gl.EnableVertexAttribArray(1);
-        _gl.VertexAttribPointer(1, 3, VertexAttribPointerType.Float, false, (uint)stride, (void*)(3 * sizeof(float)));
+    private void FocusSettingsWindow()
+    {
+        _performanceSettings = _performanceSettings with { HudEnabled = true };
+        ShowSettingsWindow();
+        Console.WriteLine("HUD focused");
+    }
 
-        // Color attribute (location = 2)
-        _gl.EnableVertexAttribArray(2);
-        _gl.VertexAttribPointer(2, 3, VertexAttribPointerType.Float, false, (uint)stride, (void*)(6 * sizeof(float)));
+    private void ShowSettingsWindow()
+    {
+        lock (_settingsWindowLock)
+        {
+            if (_settingsHud != null)
+            {
+                SettingsHUD hud = _settingsHud;
+                hud.Dispatcher.BeginInvoke(new Action(() => hud.Activate()));
+                return;
+            }
 
-        _gl.BindVertexArray(0);
+            if (_isHudStarting)
+                return;
+
+            _isHudStarting = true;
+            _settingsThread = new Thread(() =>
+            {
+                try
+                {
+                    var app = new Application();
+                    var hud = new SettingsHUD(this, _compute);
+                    hud.Closed += (_, _) =>
+                    {
+                        lock (_settingsWindowLock)
+                        {
+                            _settingsHud = null;
+                            _settingsThread = null;
+                            _isHudStarting = false;
+                        }
+                    };
+
+                    lock (_settingsWindowLock)
+                    {
+                        _settingsHud = hud;
+                        _isHudStarting = false;
+                    }
+
+                    app.Run(hud);
+                }
+                catch (Exception ex)
+                {
+                    lock (_settingsWindowLock)
+                    {
+                        _settingsHud = null;
+                        _settingsThread = null;
+                        _isHudStarting = false;
+                    }
+
+                    Console.WriteLine($"HUD failed to start: {ex.Message}");
+                }
+            });
+
+            _settingsThread.SetApartmentState(ApartmentState.STA);
+            _settingsThread.IsBackground = true;
+            _settingsThread.Start();
+        }
+    }
+
+    private void CloseSettingsWindow()
+    {
+        SettingsHUD? hud;
+        lock (_settingsWindowLock)
+            hud = _settingsHud;
+
+        if (hud == null)
+            return;
+
+        hud.Dispatcher.BeginInvoke(new Action(hud.BeginClose));
     }
 
     private unsafe void CreateGridOverlay()
     {
-        // Create a subtle grid at y=0
         const int gridSize = 10;
         const float gridStep = 0.2f;
         var gridVertices = new List<float>();
@@ -395,11 +718,8 @@ public sealed class MandelbrotApp : IDisposable
             float alpha = 1f - MathF.Abs(i) / gridSize;
             float c = 0.15f * alpha;
 
-            // Line along X
             gridVertices.AddRange([pos, -0.01f, -gridSize * gridStep, c, c, c * 1.5f]);
             gridVertices.AddRange([pos, -0.01f, gridSize * gridStep, c, c, c * 1.5f]);
-
-            // Line along Z
             gridVertices.AddRange([-gridSize * gridStep, -0.01f, pos, c, c, c * 1.5f]);
             gridVertices.AddRange([gridSize * gridStep, -0.01f, pos, c, c, c * 1.5f]);
         }
@@ -413,9 +733,9 @@ public sealed class MandelbrotApp : IDisposable
         _gl.BindVertexArray(_gridVao);
         _gl.BindBuffer(BufferTargetARB.ArrayBuffer, _gridVbo);
 
-        fixed (float* v = gridArray)
+        fixed (float* vertices = gridArray)
         {
-            _gl.BufferData(BufferTargetARB.ArrayBuffer, (nuint)(gridArray.Length * sizeof(float)), v, BufferUsageARB.StaticDraw);
+            _gl.BufferData(BufferTargetARB.ArrayBuffer, (nuint)(gridArray.Length * sizeof(float)), vertices, BufferUsageARB.StaticDraw);
         }
 
         _gl.EnableVertexAttribArray(0);
@@ -427,100 +747,6 @@ public sealed class MandelbrotApp : IDisposable
         _gl.BindVertexArray(0);
     }
 
-    private void OnUpdate(double deltaTime)
-    {
-        // FPS counter
-        _frameCount++;
-        _fpsTimer += deltaTime;
-        if (_fpsTimer >= 1.0)
-        {
-            _fps = (float)(_frameCount / _fpsTimer);
-            _window.Title = $"🌀 Mandelbrot 3D — {_fps:F0} FPS | Zoom: {_compute.Zoom:0.##e+0}x | {_compute.PrecisionStatus} | Res: {_compute.Width}x{_compute.Height}";
-            _frameCount = 0;
-            _fpsTimer = 0;
-        }
-
-        if (_adaptiveResolution)
-        {
-            UpdateAdaptiveResolution();
-        }
-
-        if (_needsRecompute)
-        {
-            RecomputeMandelbrot();
-        }
-    }
-
-    private void CycleGridResolution()
-    {
-        _adaptiveResolution = false; // Stop auto-pilot when user takes manual control
-        _gridResolution = _gridResolution switch
-        {
-            128 => 256,
-            256 => 512,
-            512 => 768,
-            768 => 1024,
-            1024 => 2048,
-            2048 => 4096,
-            _ => 128
-        };
-        _compute.Resize(_gridResolution, _gridResolution);
-        _needsRecompute = true;
-    }
-
-    private void UpdateAdaptiveResolution()
-    {
-        // Increase detail as we zoom in
-        double logZoom = Math.Log10(Math.Max(1.0, _compute.Zoom));
-        int targetRes = 512 + (int)(logZoom * 300);
-        targetRes = Math.Clamp(targetRes, 512, 4096); 
-
-        // Only resize if significantly different to prevent continuous recomputes
-        if (Math.Abs(targetRes - _gridResolution) > 128)
-        {
-            _gridResolution = targetRes;
-            _compute.Resize(_gridResolution, _gridResolution);
-            _needsRecompute = true;
-        }
-    }
-
-
-    private void OnRender(double deltaTime)
-    {
-        _gl.Clear(ClearBufferMask.ColorBufferBit | ClearBufferMask.DepthBufferBit);
-
-        float aspect = (float)_window.Size.X / _window.Size.Y;
-        Matrix4x4 view = _camera.GetViewMatrix();
-        Matrix4x4 projection = Camera.GetProjectionMatrix(aspect);
-        Matrix4x4 model = Matrix4x4.Identity;
-
-        // Render terrain
-        _gl.UseProgram(_shaderProgram);
-
-        SetUniformMatrix4(_shaderProgram, "uModel", model);
-        SetUniformMatrix4(_shaderProgram, "uView", view);
-        SetUniformMatrix4(_shaderProgram, "uProjection", projection);
-        SetUniformVec3(_shaderProgram, "uLightDir", Vector3.Normalize(new Vector3(0.5f, 1.0f, 0.3f)));
-        SetUniformVec3(_shaderProgram, "uViewPos", _camera.Position);
-
-        if (_wireframeMode)
-            _gl.PolygonMode(TriangleFace.FrontAndBack, PolygonMode.Line);
-
-        _gl.BindVertexArray(_vao);
-        unsafe { _gl.DrawElements(PrimitiveType.Triangles, (uint)_indexCount, DrawElementsType.UnsignedInt, null); }
-
-        if (_wireframeMode)
-            _gl.PolygonMode(TriangleFace.FrontAndBack, PolygonMode.Fill);
-
-        // Render grid
-        _gl.UseProgram(_gridShaderProgram);
-        Matrix4x4 vp = view * projection;
-        SetUniformMatrix4(_gridShaderProgram, "uViewProjection", vp);
-
-        _gl.BindVertexArray(_gridVao);
-        _gl.DrawArrays(PrimitiveType.Lines, 0, (uint)_gridVertexCount);
-    }
-
     private void OnResize(Vector2D<int> size)
     {
         _gl.Viewport(size);
@@ -528,17 +754,14 @@ public sealed class MandelbrotApp : IDisposable
 
     private void OnClosing()
     {
-        // Cleanup
-        _gl.DeleteVertexArray(_vao);
-        _gl.DeleteBuffer(_vbo);
-        _gl.DeleteBuffer(_ebo);
+        CloseSettingsWindow();
+        _terrainRenderer?.Dispose();
+
         _gl.DeleteVertexArray(_gridVao);
         _gl.DeleteBuffer(_gridVbo);
-        _gl.DeleteProgram(_shaderProgram);
+        _gl.DeleteProgram(_terrainShaderProgram);
         _gl.DeleteProgram(_gridShaderProgram);
     }
-
-    // --- OpenGL Helper Methods ---
 
     private uint CreateShaderProgram(string vertexSource, string fragmentSource)
     {
@@ -579,56 +802,51 @@ public sealed class MandelbrotApp : IDisposable
         return shader;
     }
 
-    private unsafe void SetUniformMatrix4(uint program, string name, Matrix4x4 matrix)
+    private unsafe void SetUniformMatrix4(int location, Matrix4x4 matrix)
     {
-        int location = _gl.GetUniformLocation(program, name);
         if (location >= 0)
-        {
             _gl.UniformMatrix4(location, 1, false, (float*)&matrix);
-        }
     }
 
-    private void SetUniformVec3(uint program, string name, Vector3 vec)
+    private void MarkDirty()
     {
-        int location = _gl.GetUniformLocation(program, name);
-        if (location >= 0)
-        {
-            _gl.Uniform3(location, vec.X, vec.Y, vec.Z);
-        }
+        _needsRecompute = true;
     }
+
+    private (int Min, int Default, int Max) GetTierBounds(PerformanceProfile profile) => profile switch
+    {
+        PerformanceProfile.Latency => (0, 1, 2),
+        PerformanceProfile.Balanced => (1, 2, 3),
+        PerformanceProfile.Quality => (2, 3, 4),
+        PerformanceProfile.Screenshot => (4, 4, 6),
+        _ => throw new ArgumentOutOfRangeException(nameof(profile), profile, null)
+    };
+
+    private int GetDefaultTierIndex(PerformanceProfile profile) => GetTierBounds(profile).Default;
 
     private static void PrintControls()
     {
         Console.WriteLine();
         Console.WriteLine("╔═══════════════════════════════════════════════════════════╗");
-        Console.WriteLine("║       🌀 GPU Mandelbrot 3D Explorer — Controls 🌀       ║");
+        Console.WriteLine("║              GPU Mandelbrot 3D Explorer                  ║");
         Console.WriteLine("╠═══════════════════════════════════════════════════════════╣");
-        Console.WriteLine("║  🖱️  Mouse Controls:                                     ║");
-        Console.WriteLine("║    Left Drag    — Orbit / rotate camera                  ║");
-        Console.WriteLine("║    Middle Drag  — Pan camera                             ║");
-        Console.WriteLine("║    Scroll Wheel — Zoom camera in/out                     ║");
-        Console.WriteLine("║                                                          ║");
-        Console.WriteLine("║  ⌨️  Mandelbrot Navigation:                               ║");
-        Console.WriteLine("║    W/A/S/D or Arrow Keys — Pan the fractal               ║");
-        Console.WriteLine("║    +/- (or Numpad)       — Zoom into fractal             ║");
-        Console.WriteLine("║    I/K                   — Increase/decrease iterations   ║");
-        Console.WriteLine("║    PageUp/PageDown       — Adjust height scale            ║");
-        Console.WriteLine("║                                                          ║");
-        Console.WriteLine("║  🎨 Display:                                              ║");
-        Console.WriteLine("║    C — Cycle color palette                                ║");
-        Console.WriteLine("║    F — Toggle wireframe mode                              ║");
-        Console.WriteLine("║    G — Cycle grid resolution (up to 4096)                 ║");
-        Console.WriteLine("║    P — Print current coordinates to console               ║");
-        Console.WriteLine("║    1-5 — Jump to location presets                         ║");
-        Console.WriteLine("║    (Hold Shift for fine pan and zoom)                     ║");
-        Console.WriteLine("║    R — Reset view                                         ║");
-        Console.WriteLine("║    Esc — Exit                                             ║");
+        Console.WriteLine("║ Mouse: Left drag orbit | Middle drag pan | Wheel zoom    ║");
+        Console.WriteLine("║ Move fractal: W/A/S/D or Arrow keys                      ║");
+        Console.WriteLine("║ Zoom fractal: +/- (hold Shift for fine control)          ║");
+        Console.WriteLine("║ Iterations: I / K                                        ║");
+        Console.WriteLine("║ Height scale: PageUp / PageDown                          ║");
+        Console.WriteLine("║ Palette: C | Wireframe: F | Resolution tier: G           ║");
+        Console.WriteLine("║ Precision: M | Profile: N | Shading: L                   ║");
+        Console.WriteLine("║ Adaptive res: O | HUD focus: H | VSync: V                ║");
+        Console.WriteLine("║ Print coords: P                                          ║");
+        Console.WriteLine("║ Presets: 1..6 | Reset: R | Exit: Esc                     ║");
         Console.WriteLine("╚═══════════════════════════════════════════════════════════╝");
         Console.WriteLine();
     }
 
     public void Dispose()
     {
+        CloseSettingsWindow();
         _compute?.Dispose();
         _input?.Dispose();
         _window?.Dispose();
