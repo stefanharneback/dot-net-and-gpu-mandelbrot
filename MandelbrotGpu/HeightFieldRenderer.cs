@@ -65,6 +65,8 @@ public sealed unsafe class HeightFieldRenderer : IDisposable
             _gl.Uniform1(paletteLocation, 1);
     }
 
+    public uint HeightTexture => _heightTexture;
+
     public int RenderMeshResolution { get; private set; }
 
     public double LastGridBuildMs { get; private set; }
@@ -136,49 +138,27 @@ public sealed unsafe class HeightFieldRenderer : IDisposable
         }
     }
 
-    public double UploadHeightField(HeightFieldFrame frame)
+    public unsafe void EnsureTextureSize(int width, int height)
     {
-        long uploadStart = Stopwatch.GetTimestamp();
+        if (width == _heightTextureWidth && height == _heightTextureHeight)
+            return;
 
         _gl.ActiveTexture(TextureUnit.Texture0);
         _gl.BindTexture(TextureTarget.Texture2D, _heightTexture);
 
-        fixed (float* data = frame.Data)
-        {
-            if (frame.Width != _heightTextureWidth || frame.Height != _heightTextureHeight)
-            {
-                _gl.TexImage2D(
-                    TextureTarget.Texture2D,
-                    0,
-                    (int)InternalFormat.R32f,
-                    (uint)frame.Width,
-                    (uint)frame.Height,
-                    0,
-                    PixelFormat.Red,
-                    PixelType.Float,
-                    data);
+        _gl.TexImage2D(
+            TextureTarget.Texture2D,
+            0,
+            (int)InternalFormat.R32f,
+            (uint)width,
+            (uint)height,
+            0,
+            PixelFormat.Red,
+            PixelType.Float,
+            (void*)0);
 
-                _heightTextureWidth = frame.Width;
-                _heightTextureHeight = frame.Height;
-            }
-            else
-            {
-                _gl.TexSubImage2D(
-                    TextureTarget.Texture2D,
-                    0,
-                    0,
-                    0,
-                    (uint)frame.Width,
-                    (uint)frame.Height,
-                    PixelFormat.Red,
-                    PixelType.Float,
-                    data);
-            }
-        }
-
-        frame.TextureHandle = _heightTexture;
-        frame.TextureUploadMs = Stopwatch.GetElapsedTime(uploadStart).TotalMilliseconds;
-        return frame.TextureUploadMs;
+        _heightTextureWidth = width;
+        _heightTextureHeight = height;
     }
 
     public void Render(
@@ -212,6 +192,8 @@ public sealed unsafe class HeightFieldRenderer : IDisposable
             _gl.Uniform1(_paletteCyclesLocation, paletteCycles);
         if (_shadingModeLocation >= 0)
             _gl.Uniform1(_shadingModeLocation, shadingMode == ShadingMode.Full ? 1 : 0);
+
+        _gl.BindBufferBase(BufferTargetARB.ShaderStorageBuffer, 1, frame.BoundsBufferHandle);
 
         _gl.ActiveTexture(TextureUnit.Texture0);
         _gl.BindTexture(TextureTarget.Texture2D, _heightTexture);

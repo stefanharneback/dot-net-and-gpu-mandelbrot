@@ -1,0 +1,4 @@
+🌀 Starting GPU Mandelbrot 3D Explorer...
+   Built with .NET 10 + ILGPU + Silk.NET/OpenGL
+
+Mandelbrot compute initialized with OpenGL Compute Shaders.

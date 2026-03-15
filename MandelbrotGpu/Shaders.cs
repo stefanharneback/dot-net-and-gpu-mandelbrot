@@ -6,7 +6,7 @@ namespace MandelbrotGpu;
 public static class Shaders
 {
     public const string TerrainVertexShader = @"
-#version 330 core
+#version 430 core
 
 layout(location = 0) in vec2 aBaseXZ;
 layout(location = 1) in vec2 aUv;
@@ -55,12 +55,17 @@ void main()
 ";
 
     public const string TerrainFragmentShader = @"
-#version 330 core
+#version 430 core
 
 in vec3 vNormal;
 in vec3 vFragPos;
 in float vValue;
 in float vHeight;
+
+layout(std430, binding = 1) buffer MinMaxBuffer {
+    uint bMinVal;
+    uint bMaxVal;
+};
 
 uniform sampler2D uPalette;
 uniform vec3 uLightDir;
@@ -90,7 +95,13 @@ vec3 samplePalette(float value)
 
 void main()
 {
-    vec3 baseColor = samplePalette(vValue);
+    float minVal = uintBitsToFloat(bMinVal);
+    float maxVal = uintBitsToFloat(bMaxVal);
+
+    float range = max(0.000001, maxVal - minVal);
+    float normValue = clamp((vValue - minVal) / range, 0.0, 1.0);
+
+    vec3 baseColor = samplePalette(normValue);
     vec3 norm = normalize(vNormal);
     vec3 lightDir = normalize(uLightDir);
     vec3 viewDir = normalize(uViewPos - vFragPos);
@@ -154,6 +165,271 @@ out vec4 FragColor;
 void main()
 {
     FragColor = vec4(vColor, 0.4);
+}
+";
+
+    public const string MandelbrotComputeShaderF32 = @"
+#version 430 core
+
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(binding = 0, r32f) writeonly uniform image2D uOutputImage;
+
+layout(std430, binding = 1) buffer MinMaxBuffer {
+    uint bMinVal;
+    uint bMaxVal;
+};
+
+uniform int uWidth;
+uniform int uHeight;
+uniform float uXMin;
+uniform float uYMin;
+uniform float uXMax;
+uniform float uYMax;
+uniform int uMaxIterations;
+
+shared uint localMin;
+shared uint localMax;
+
+void main()
+{
+    // Initialize shared variables for the local workgroup
+    if (gl_LocalInvocationIndex == 0)
+    {
+        localMin = 0xFFFFFFFFu;
+        localMax = 0u;
+    }
+    barrier();
+
+    ivec2 pixelCoords = ivec2(gl_GlobalInvocationID.xy);
+    if (pixelCoords.x >= uWidth || pixelCoords.y >= uHeight)
+        return;
+
+    float px = float(pixelCoords.x) / float(uWidth - 1);
+    float py = float(pixelCoords.y) / float(uHeight - 1);
+
+    float x0 = uXMin + (uXMax - uXMin) * px;
+    float y0 = uYMin + (uYMax - uYMin) * py;
+
+    // --- Optimization 1: Cardioid and period-2 bulb rejection ---
+    float q = (x0 - 0.25) * (x0 - 0.25) + y0 * y0;
+    if (q * (q + (x0 - 0.25)) <= 0.25 * y0 * y0)
+    {
+        imageStore(uOutputImage, pixelCoords, vec4(0.0));
+        return;
+    }
+    float bx = x0 + 1.0;
+    if (bx * bx + y0 * y0 <= 0.0625)
+    {
+        imageStore(uOutputImage, pixelCoords, vec4(0.0));
+        return;
+    }
+
+    float x = 0.0;
+    float y = 0.0;
+    float xOld = 0.0;
+    float yOld = 0.0;
+    int iteration = 0;
+    int periodCheck = 0;
+
+    // --- Optimization 2: Loop Unrolling & Periodicity Checking ---
+    int unrolledLimit = uMaxIterations - 4;
+    while (iteration < unrolledLimit)
+    {
+        float xx = x * x, yy = y * y;
+        if (xx + yy > 4.0) break;
+        y = 2.0 * x * y + y0; x = xx - yy + x0; iteration++;
+
+        xx = x * x; yy = y * y;
+        if (xx + yy > 4.0) break;
+        y = 2.0 * x * y + y0; x = xx - yy + x0; iteration++;
+
+        xx = x * x; yy = y * y;
+        if (xx + yy > 4.0) break;
+        y = 2.0 * x * y + y0; x = xx - yy + x0; iteration++;
+
+        xx = x * x; yy = y * y;
+        if (xx + yy > 4.0) break;
+        y = 2.0 * x * y + y0; x = xx - yy + x0; iteration++;
+
+        if (++periodCheck > 20)
+        {
+            if (abs(x - xOld) < 1e-7 && abs(y - yOld) < 1e-7)
+            {
+                iteration = uMaxIterations;
+                break;
+            }
+            xOld = x; yOld = y;
+            periodCheck = 0;
+        }
+    }
+
+    while (x * x + y * y <= 4.0 && iteration < uMaxIterations)
+    {
+        float xTemp = x * x - y * y + x0;
+        y = 2.0 * x * y + y0;
+        x = xTemp;
+        iteration++;
+    }
+
+    if (iteration < uMaxIterations)
+    {
+        float zn = x * x + y * y;
+        float log2zn = log2(zn) * 0.5;
+        float nu = log2(log2zn);
+        float value = (float(iteration) + 1.0 - nu) / float(uMaxIterations);
+        imageStore(uOutputImage, pixelCoords, vec4(value, 0.0, 0.0, 0.0));
+        
+        uint uVal = floatBitsToUint(value);
+        atomicMin(localMin, uVal);
+        atomicMax(localMax, uVal);
+    }
+    else
+    {
+        imageStore(uOutputImage, pixelCoords, vec4(0.0));
+    }
+
+    // Wait for all threads in the workgroup to finish tracking
+    barrier();
+    
+    // Commit the local extrema to the global SSBO
+    if (gl_LocalInvocationIndex == 0)
+    {
+        atomicMin(bMinVal, localMin);
+        atomicMax(bMaxVal, localMax);
+    }
+}
+";
+
+    public const string MandelbrotComputeShaderF64 = @"
+#version 430 core
+
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(binding = 0, r32f) writeonly uniform image2D uOutputImage;
+
+layout(std430, binding = 1) buffer MinMaxBuffer {
+    uint bMinVal;
+    uint bMaxVal;
+};
+
+uniform int uWidth;
+uniform int uHeight;
+uniform double uXMin;
+uniform double uYMin;
+uniform double uXMax;
+uniform double uYMax;
+uniform int uMaxIterations;
+
+shared uint localMin;
+shared uint localMax;
+
+void main()
+{
+    // Initialize shared variables for the local workgroup
+    if (gl_LocalInvocationIndex == 0)
+    {
+        localMin = 0xFFFFFFFFu;
+        localMax = 0u;
+    }
+    barrier();
+
+    ivec2 pixelCoords = ivec2(gl_GlobalInvocationID.xy);
+    if (pixelCoords.x >= uWidth || pixelCoords.y >= uHeight)
+        return;
+
+    double px = double(pixelCoords.x) / double(uWidth - 1);
+    double py = double(pixelCoords.y) / double(uHeight - 1);
+
+    double x0 = uXMin + (uXMax - uXMin) * px;
+    double y0 = uYMin + (uYMax - uYMin) * py;
+
+    // --- Optimization 1: Cardioid and period-2 bulb rejection ---
+    double q = (x0 - 0.25) * (x0 - 0.25) + y0 * y0;
+    if (q * (q + (x0 - 0.25)) <= 0.25 * y0 * y0)
+    {
+        imageStore(uOutputImage, pixelCoords, vec4(0.0));
+        return;
+    }
+    double bx = x0 + 1.0;
+    if (bx * bx + y0 * y0 <= 0.0625)
+    {
+        imageStore(uOutputImage, pixelCoords, vec4(0.0));
+        return;
+    }
+
+    double x = 0.0;
+    double y = 0.0;
+    double xOld = 0.0;
+    double yOld = 0.0;
+    int iteration = 0;
+    int periodCheck = 0;
+
+    // --- Optimization 2: Loop Unrolling & Periodicity Checking ---
+    int unrolledLimit = uMaxIterations - 4;
+    while (iteration < unrolledLimit)
+    {
+        double xx = x * x, yy = y * y;
+        if (xx + yy > 4.0) break;
+        y = 2.0 * x * y + y0; x = xx - yy + x0; iteration++;
+
+        xx = x * x; yy = y * y;
+        if (xx + yy > 4.0) break;
+        y = 2.0 * x * y + y0; x = xx - yy + x0; iteration++;
+
+        xx = x * x; yy = y * y;
+        if (xx + yy > 4.0) break;
+        y = 2.0 * x * y + y0; x = xx - yy + x0; iteration++;
+
+        xx = x * x; yy = y * y;
+        if (xx + yy > 4.0) break;
+        y = 2.0 * x * y + y0; x = xx - yy + x0; iteration++;
+
+        if (++periodCheck > 20)
+        {
+            if (abs(x - xOld) < 1e-13 && abs(y - yOld) < 1e-13)
+            {
+                iteration = uMaxIterations;
+                break;
+            }
+            xOld = x; yOld = y;
+            periodCheck = 0;
+        }
+    }
+
+    while (x * x + y * y <= 4.0 && iteration < uMaxIterations)
+    {
+        double xTemp = x * x - y * y + x0;
+        y = 2.0 * x * y + y0;
+        x = xTemp;
+        iteration++;
+    }
+
+    if (iteration < uMaxIterations)
+    {
+        double zn = x * x + y * y;
+        // fallback to float for log operations as double logic isn't strictly necessary for shading calculation
+        double log2zn = log2(float(zn)) * 0.5;
+        double nu = log2(float(log2zn));
+        float value = float((double(iteration) + 1.0 - nu) / double(uMaxIterations));
+        imageStore(uOutputImage, pixelCoords, vec4(value, 0.0, 0.0, 0.0));
+        
+        uint uVal = floatBitsToUint(value);
+        atomicMin(localMin, uVal);
+        atomicMax(localMax, uVal);
+    }
+    else
+    {
+        imageStore(uOutputImage, pixelCoords, vec4(0.0));
+    }
+
+    // Wait for all threads in the workgroup to finish tracking
+    barrier();
+    
+    // Commit the local extrema to the global SSBO
+    if (gl_LocalInvocationIndex == 0)
+    {
+        atomicMin(bMinVal, localMin);
+        atomicMax(bMaxVal, localMax);
+    }
 }
 ";
 }

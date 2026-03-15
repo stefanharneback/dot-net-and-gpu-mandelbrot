@@ -3,7 +3,7 @@ namespace MandelbrotGpu;
 public sealed class HeightFieldFrame
 {
     public HeightFieldFrame(
-        float[] data,
+        float[]? data,
         int width,
         int height,
         string precisionMode,
@@ -22,7 +22,7 @@ public sealed class HeightFieldFrame
         ManagedAllocatedBytes = managedAllocatedBytes;
     }
 
-    public float[] Data { get; }
+    public float[]? Data { get; }
 
     public int Width { get; }
 
@@ -39,6 +39,8 @@ public sealed class HeightFieldFrame
     public long ManagedAllocatedBytes { get; }
 
     public uint TextureHandle { get; internal set; }
+
+    public uint BoundsBufferHandle { get; internal set; }
 
     public double TextureUploadMs { get; internal set; }
 }

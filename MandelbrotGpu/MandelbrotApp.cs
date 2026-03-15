@@ -143,7 +143,7 @@ public sealed class MandelbrotApp : IDisposable
         _gl.BlendFunc(BlendingFactor.SrcAlpha, BlendingFactor.OneMinusSrcAlpha);
         _gl.ClearColor(0.02f, 0.02f, 0.05f, 1.0f);
 
-        _compute = new MandelbrotCompute(_performanceSettings.ComputeResolution, _performanceSettings.ComputeResolution);
+        _compute = new MandelbrotCompute(_gl, _performanceSettings.ComputeResolution, _performanceSettings.ComputeResolution);
         _palette = ColorPalette.GeneratePalette(_currentPalette);
         _paletteCycles = ColorPalette.GetPaletteCycles(_currentPalette);
 
@@ -455,8 +455,8 @@ public sealed class MandelbrotApp : IDisposable
         long recomputeStart = Stopwatch.GetTimestamp();
         long allocatedBefore = GC.GetTotalAllocatedBytes(false);
 
-        HeightFieldFrame frame = _compute.Compute();
-        _terrainRenderer.UploadHeightField(frame);
+        _terrainRenderer.EnsureTextureSize(_compute.Width, _compute.Height);
+        HeightFieldFrame frame = _compute.Compute(_terrainRenderer.HeightTexture);
         _currentFrame = frame;
 
         _latestMetrics = _latestMetrics with

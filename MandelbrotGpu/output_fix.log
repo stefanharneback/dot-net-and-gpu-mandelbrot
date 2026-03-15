@@ -1,0 +1,57 @@
+🌀 Starting GPU Mandelbrot 3D Explorer...
+   Built with .NET 10 + ILGPU + Silk.NET/OpenGL
+
+Mandelbrot compute initialized with OpenGL Compute Shaders.
+
+╔═══════════════════════════════════════════════════════════╗
+║              GPU Mandelbrot 3D Explorer                  ║
+╠═══════════════════════════════════════════════════════════╣
+║ Mouse: Left drag orbit | Middle drag pan | Wheel zoom    ║
+║ Move fractal: W/A/S/D or Arrow keys                      ║
+║ Zoom fractal: +/- (hold Shift for fine control)          ║
+║ Iterations: I / K                                        ║
+║ Height scale: PageUp / PageDown                          ║
+║ Palette: C | Wireframe: F | Resolution tier: G           ║
+║ Precision: M | Profile: N | Shading: L                   ║
+║ Adaptive res: O | Focus HUDs: H | VSync: V               ║
+║ Print coords: P                                          ║
+║ Presets: 1..6 | Reset: R | Exit: Esc                     ║
+╚═══════════════════════════════════════════════════════════╝
+
+Height scale: 0,70
+Height scale: 0,80
+Height scale: 0,70
+Height scale: 0,60
+Height scale: 0,50
+Height scale: 0,40
+Height scale: 0,30
+Height scale: 0,20
+Height scale: 0,10
+Height scale: 0,05
+Height scale: 0,05
+Height scale: 0,05
+Palette: Fire
+Palette: Ocean
+Palette: Neon
+Max iterations: 384
+Max iterations: 512
+Max iterations: 640
+Max iterations: 768
+Max iterations: 896
+Max iterations: 1 024
+Max iterations: 2 048
+Max iterations: 4 096
+Max iterations: 8 192
+Height scale: 0,15
+Height scale: 0,25
+Height scale: 0,35
+Height scale: 0,45
+Max iterations: 16 384
+Max iterations: 32 768
+Profile: Balanced | Compute: 1024 | Render: 768 | Shading: Full | HUD: ON
+Profile: Quality | Compute: 1536 | Render: 1024 | Shading: Full | HUD: ON
+Precision Mode: ForceFP32
+Precision Mode: ForceFP64
+Precision Mode: Auto
+Precision Mode: ForceFP32
+Precision Mode: ForceFP64

@@ -1,6 +1,4 @@
-using ILGPU;
-using ILGPU.Algorithms;
-using ILGPU.Runtime;
+using Silk.NET.OpenGL;
 using System.Diagnostics;
 
 namespace MandelbrotGpu;
@@ -13,29 +11,14 @@ public enum PrecisionMode
 }
 
 /// <summary>
-/// GPU-accelerated Mandelbrot set computation using ILGPU.
+/// GPU-accelerated Mandelbrot set computation using OpenGL Compute Shaders.
 /// </summary>
 public sealed class MandelbrotCompute : IDisposable
 {
     public PrecisionMode CurrentPrecisionMode { get; set; } = PrecisionMode.Auto;
     public bool IsComputing { get; private set; }
-    // FP32 and FP64 kernels compiled up front
-    private readonly Action<Index1D, ArrayView1D<float, Stride1D.Dense>,
-        int, int, float, float, float, float, int> _kernelF32;
-    private readonly Action<Index1D, ArrayView1D<float, Stride1D.Dense>,
-        int, int, double, double, double, double, int> _kernelF64;
-
-    private readonly Context _context;
-    private readonly Accelerator _accelerator;
-
-    // Re-use a single GPU output buffer (avoids allocation every compute frame)
-    private MemoryBuffer1D<float, Stride1D.Dense>? _deviceBuffer;
-    private int _deviceBufferSize;
-    private float[]? _cpuBuffer;
-
+    
     // Zoom threshold: below this, float is accurate enough (fast), above we need double
-    // float has ~7 decimal digits of precision; at zoom ~1e5 the pixel spacing is ~4e-5/width
-    // which is about 2e-8 for 512px → exceeds float epsilon (~1.2e-7) around zoom ~1e6
     public const double FloatPrecisionZoomLimit = 500_000.0;
 
     public double CenterX { get; set; } = -0.5;
@@ -53,258 +36,105 @@ public sealed class MandelbrotCompute : IDisposable
         _ => Zoom < FloatPrecisionZoomLimit ? "AUTO: FP32 (Fast)" : "AUTO: FP64 (Precise)"
     };
 
-    public MandelbrotCompute(int width, int height)
+    private readonly GL _gl;
+    private readonly uint _computeProgramF32;
+    private readonly uint _computeProgramF64;
+    private readonly uint _ssboMinMax;
+
+    // Uniform locations for F32 shader
+    private readonly int _uWidthF32;
+    private readonly int _uHeightF32;
+    private readonly int _uXMinF32;
+    private readonly int _uYMinF32;
+    private readonly int _uXMaxF32;
+    private readonly int _uYMaxF32;
+    private readonly int _uMaxIterationsF32;
+
+    // Uniform locations for F64 shader
+    private readonly int _uWidthF64;
+    private readonly int _uHeightF64;
+    private readonly int _uXMinF64;
+    private readonly int _uYMinF64;
+    private readonly int _uXMaxF64;
+    private readonly int _uYMaxF64;
+    private readonly int _uMaxIterationsF64;
+
+    public MandelbrotCompute(GL gl, int width, int height)
     {
+        _gl = gl;
         Width  = width;
         Height = height;
 
-        _context = Context.Create(builder => builder.Default().EnableAlgorithms());
+        _computeProgramF32 = CreateComputeProgram(Shaders.MandelbrotComputeShaderF32);
+        _computeProgramF64 = CreateComputeProgram(Shaders.MandelbrotComputeShaderF64);
 
-        // Try to get a GPU accelerator; robust fallback to CPU
-        Device? bestDevice = _context.GetPreferredDevice(preferCPU: false);
-        if (bestDevice == null)
-        {
-            Console.WriteLine("Warning: No preferred device found. Defaulting to first available.");
-            bestDevice = _context.Devices.FirstOrDefault();
-            if (bestDevice == null)
-                throw new NotSupportedException("No supported ILGPU devices found on this machine.");
-        }
+        // Fetch variable locations for FP32
+        _uWidthF32 = _gl.GetUniformLocation(_computeProgramF32, "uWidth");
+        _uHeightF32 = _gl.GetUniformLocation(_computeProgramF32, "uHeight");
+        _uXMinF32 = _gl.GetUniformLocation(_computeProgramF32, "uXMin");
+        _uYMinF32 = _gl.GetUniformLocation(_computeProgramF32, "uYMin");
+        _uXMaxF32 = _gl.GetUniformLocation(_computeProgramF32, "uXMax");
+        _uYMaxF32 = _gl.GetUniformLocation(_computeProgramF32, "uYMax");
+        _uMaxIterationsF32 = _gl.GetUniformLocation(_computeProgramF32, "uMaxIterations");
 
-        try
-        {
-            _accelerator = bestDevice.CreateAccelerator(_context);
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"Failed to create accelerator on {bestDevice.Name}: {ex.Message}");
-            Console.WriteLine("Falling back to CPU Accelerator.");
-            var cpuDevice = _context.Devices.FirstOrDefault(d => d.AcceleratorType == AcceleratorType.CPU)
-                            ?? throw new NotSupportedException("No CPU accelerator available.");
-            _accelerator = cpuDevice.CreateAccelerator(_context);
-        }
+        // Fetch variable locations for FP64
+        _uWidthF64 = _gl.GetUniformLocation(_computeProgramF64, "uWidth");
+        _uHeightF64 = _gl.GetUniformLocation(_computeProgramF64, "uHeight");
+        _uXMinF64 = _gl.GetUniformLocation(_computeProgramF64, "uXMin");
+        _uYMinF64 = _gl.GetUniformLocation(_computeProgramF64, "uYMin");
+        _uXMaxF64 = _gl.GetUniformLocation(_computeProgramF64, "uXMax");
+        _uYMaxF64 = _gl.GetUniformLocation(_computeProgramF64, "uYMax");
+        _uMaxIterationsF64 = _gl.GetUniformLocation(_computeProgramF64, "uMaxIterations");
 
-        Console.WriteLine($"Using accelerator: {_accelerator.Name} ({_accelerator.AcceleratorType})");
+        // Create SSBO for min/max tracking (2 uints)
+        _ssboMinMax = _gl.GenBuffer();
+        _gl.BindBuffer(BufferTargetARB.ShaderStorageBuffer, _ssboMinMax);
+        // Allocate 8 bytes (2x uint)
+        unsafe { _gl.BufferData(BufferTargetARB.ShaderStorageBuffer, 2 * sizeof(uint), null, BufferUsageARB.DynamicCopy); }
+        _gl.BindBuffer(BufferTargetARB.ShaderStorageBuffer, 0);
 
-        // Compile both kernels up front so there's no JIT lag during rendering
-        _kernelF32 = _accelerator.LoadAutoGroupedStreamKernel<
-            Index1D, ArrayView1D<float, Stride1D.Dense>,
-            int, int, float, float, float, float, int>(MandelbrotKernelF32);
-
-        _kernelF64 = _accelerator.LoadAutoGroupedStreamKernel<
-            Index1D, ArrayView1D<float, Stride1D.Dense>,
-            int, int, double, double, double, double, int>(MandelbrotKernelF64);
+        Console.WriteLine("Mandelbrot compute initialized with OpenGL Compute Shaders.");
     }
 
-    // -------------------------------------------------------------------------
-    // KERNEL — 32-bit float (fast, good up to ~500k zoom)
-    // -------------------------------------------------------------------------
-    /// <summary>
-    /// Fast FP32 Mandelbrot kernel with cardioid/bulb pre-check and loop unrolling.
-    /// </summary>
-    private static void MandelbrotKernelF32(
-        Index1D index,
-        ArrayView1D<float, Stride1D.Dense> output,
-        int width, int height,
-        float xMin, float yMin, float xMax, float yMax,
-        int maxIterations)
+    private uint CreateComputeProgram(string source)
     {
-        int px = index % width;
-        int py = index / width;
+        uint shader = _gl.CreateShader(ShaderType.ComputeShader);
+        _gl.ShaderSource(shader, source);
+        _gl.CompileShader(shader);
 
-        float x0 = xMin + (xMax - xMin) * px / (width  - 1);
-        float y0 = yMin + (yMax - yMin) * py / (height - 1);
-
-        // --- Optimization 1: Cardioid and period-2 bulb rejection ---
-        // These checks skip the black interior pixels instantly (often 30–50% of all pixels)
-        float q = (x0 - 0.25f) * (x0 - 0.25f) + y0 * y0;
-        if (q * (q + (x0 - 0.25f)) <= 0.25f * y0 * y0)
+        _gl.GetShader(shader, ShaderParameterName.CompileStatus, out int compileStatus);
+        if (compileStatus == 0)
         {
-            output[index] = 0.0f; // inside main cardioid
-            return;
-        }
-        float bx = x0 + 1.0f;
-        if (bx * bx + y0 * y0 <= 0.0625f)
-        {
-            output[index] = 0.0f; // inside period-2 bulb
-            return;
+            string infoLog = _gl.GetShaderInfoLog(shader);
+            throw new Exception($"Compute shader compilation failed: {infoLog}");
         }
 
-        float x = 0f, y = 0f;
-        float xOld = 0f, yOld = 0f;
-        int iteration = 0;
-        int periodCheck = 0;
+        uint program = _gl.CreateProgram();
+        _gl.AttachShader(program, shader);
+        _gl.LinkProgram(program);
 
-        // --- Optimization 2: Loop Unrolling & Periodicity Checking ---
-        int unrolledLimit = maxIterations - 4;
-        while (iteration < unrolledLimit)
+        _gl.GetProgram(program, ProgramPropertyARB.LinkStatus, out int linkStatus);
+        if (linkStatus == 0)
         {
-            float xx = x * x, yy = y * y;
-            if (xx + yy > 4f) goto done;
-            y = 2f * x * y + y0; x = xx - yy + x0; iteration++;
-
-            xx = x * x; yy = y * y;
-            if (xx + yy > 4f) goto done;
-            y = 2f * x * y + y0; x = xx - yy + x0; iteration++;
-
-            xx = x * x; yy = y * y;
-            if (xx + yy > 4f) goto done;
-            y = 2f * x * y + y0; x = xx - yy + x0; iteration++;
-
-            xx = x * x; yy = y * y;
-            if (xx + yy > 4f) goto done;
-            y = 2f * x * y + y0; x = xx - yy + x0; iteration++;
-
-            // Periodicity check: check if we've circled back to a previous point
-            // Every 20 iterations, record or compare
-            if (++periodCheck > 20)
-            {
-                if (XMath.Abs(x - xOld) < 1e-7f && XMath.Abs(y - yOld) < 1e-7f)
-                {
-                    iteration = maxIterations;
-                    goto done;
-                }
-                xOld = x; yOld = y;
-                periodCheck = 0;
-            }
-        }
-        // Remaining iterations
-        while (x * x + y * y <= 4f && iteration < maxIterations)
-        {
-            float xTemp = x * x - y * y + x0;
-            y = 2f * x * y + y0;
-            x = xTemp;
-            iteration++;
+            string infoLog = _gl.GetProgramInfoLog(program);
+            throw new Exception($"Compute program linking failed: {infoLog}");
         }
 
-        done:
-        if (iteration < maxIterations)
-        {
-            float zn     = x * x + y * y;
-            float log2zn = XMath.Log2(zn) * 0.5f;
-            float nu     = XMath.Log2(log2zn);
-            output[index] = (iteration + 1f - nu) / maxIterations;
-        }
-        else
-        {
-            output[index] = 0.0f;
-        }
+        _gl.DeleteShader(shader);
+        return program;
     }
 
-    // -------------------------------------------------------------------------
-    // KERNEL — 64-bit double (precise, for deep zooms > ~500k)
-    // -------------------------------------------------------------------------
     /// <summary>
-    /// High-precision FP64 Mandelbrot kernel with cardioid/bulb pre-check and loop unrolling.
+    /// Computes the Mandelbrot set into the given texture using the fastest
+    /// compute shader (FP32 or FP64) based on the current zoom level.
     /// </summary>
-    private static void MandelbrotKernelF64(
-        Index1D index,
-        ArrayView1D<float, Stride1D.Dense> output,
-        int width, int height,
-        double xMin, double yMin, double xMax, double yMax,
-        int maxIterations)
-    {
-        int px = index % width;
-        int py = index / width;
-
-        double x0 = xMin + (xMax - xMin) * px / (width  - 1);
-        double y0 = yMin + (yMax - yMin) * py / (height - 1);
-
-        // --- Optimization 1: Cardioid and period-2 bulb rejection ---
-        double q = (x0 - 0.25) * (x0 - 0.25) + y0 * y0;
-        if (q * (q + (x0 - 0.25)) <= 0.25 * y0 * y0)
-        {
-            output[index] = 0.0f;
-            return;
-        }
-        double bx = x0 + 1.0;
-        if (bx * bx + y0 * y0 <= 0.0625)
-        {
-            output[index] = 0.0f;
-            return;
-        }
-
-        double x = 0.0, y = 0.0;
-        double xOld = 0.0, yOld = 0.0;
-        int iteration = 0;
-        int periodCheck = 0;
-
-        // --- Optimization 2: Loop unrolling & Periodicity Checking ---
-        int unrolledLimit = maxIterations - 4;
-        while (iteration < unrolledLimit)
-        {
-            double xx = x * x, yy = y * y;
-            if (xx + yy > 4.0) goto done;
-            y = 2.0 * x * y + y0; x = xx - yy + x0; iteration++;
-
-            xx = x * x; yy = y * y;
-            if (xx + yy > 4.0) goto done;
-            y = 2.0 * x * y + y0; x = xx - yy + x0; iteration++;
-
-            xx = x * x; yy = y * y;
-            if (xx + yy > 4.0) goto done;
-            y = 2.0 * x * y + y0; x = xx - yy + x0; iteration++;
-
-            xx = x * x; yy = y * y;
-            if (xx + yy > 4.0) goto done;
-            y = 2.0 * x * y + y0; x = xx - yy + x0; iteration++;
-
-            if (++periodCheck > 20)
-            {
-                if (XMath.Abs(x - xOld) < 1e-13 && XMath.Abs(y - yOld) < 1e-13)
-                {
-                    iteration = maxIterations;
-                    goto done;
-                }
-                xOld = x; yOld = y;
-                periodCheck = 0;
-            }
-        }
-        while (x * x + y * y <= 4.0 && iteration < maxIterations)
-        {
-            double xTemp = x * x - y * y + x0;
-            y = 2.0 * x * y + y0;
-            x = xTemp;
-            iteration++;
-        }
-
-        done:
-        if (iteration < maxIterations)
-        {
-            double zn     = x * x + y * y;
-            double log2zn = XMath.Log2((float)zn) * 0.5;
-            double nu     = XMath.Log2((float)log2zn);
-            output[index] = (float)((iteration + 1.0 - nu) / maxIterations);
-        }
-        else
-        {
-            output[index] = 0.0f;
-        }
-    }
-
-    // -------------------------------------------------------------------------
-    // Host-side Compute() — selects kernel and manages buffer
-    // -------------------------------------------------------------------------
-    /// <summary>
-    /// Computes the Mandelbrot set, automatically selecting the fastest
-    /// kernel (FP32 or FP64) based on the current zoom level.
-    /// </summary>
-    public HeightFieldFrame Compute()
+    public HeightFieldFrame Compute(uint targetTextureHandle)
     {
         IsComputing = true;
         try
         {
             long allocatedBefore = GC.GetTotalAllocatedBytes(false);
-            int totalPixels = Width * Height;
-
-            // Re-use or allocate GPU output buffer
-            if (_deviceBuffer == null || _deviceBufferSize != totalPixels)
-            {
-                _deviceBuffer?.Dispose();
-                _deviceBuffer     = _accelerator.Allocate1D<float>(totalPixels);
-                _deviceBufferSize = totalPixels;
-                _cpuBuffer = new float[totalPixels];
-            }
-
+            
             double aspectRatio = (double)Width / Height;
             double rangeY = 2.0 / Zoom;
             double rangeX = rangeY * aspectRatio;
@@ -314,7 +144,6 @@ public sealed class MandelbrotCompute : IDisposable
             double yMin = CenterY - rangeY;
             double yMax = CenterY + rangeY;
 
-            // --- Optimization 3: Precision Selection ---
             bool useF32 = CurrentPrecisionMode switch
             {
                 PrecisionMode.ForceFP32 => true,
@@ -323,37 +152,72 @@ public sealed class MandelbrotCompute : IDisposable
             };
 
             long dispatchStart = Stopwatch.GetTimestamp();
+
+            // Clear the MinMax SSBO [0xFFFFFFFF, 0] so atomic limits can work correctly.
+            _gl.BindBuffer(BufferTargetARB.ShaderStorageBuffer, _ssboMinMax);
+            ReadOnlySpan<uint> initialMinMax = stackalloc uint[] { 0xFFFFFFFFu, 0u };
+            unsafe
+            {
+                fixed (uint* ptr = initialMinMax)
+                {
+                    _gl.BufferSubData(BufferTargetARB.ShaderStorageBuffer, 0, 2 * sizeof(uint), ptr);
+                }
+            }
+            _gl.BindBufferBase(BufferTargetARB.ShaderStorageBuffer, 1, _ssboMinMax);
+
+            // Bind the texture as an image so the compute shader can write to it
+            _gl.BindImageTexture(0, targetTextureHandle, 0, false, 0, GLEnum.WriteOnly, GLEnum.R32f);
+
             if (useF32)
             {
-                _kernelF32(totalPixels, _deviceBuffer.View,
-                    Width, Height,
-                    (float)xMin, (float)yMin, (float)xMax, (float)yMax,
-                    MaxIterations);
+                _gl.UseProgram(_computeProgramF32);
+                _gl.Uniform1(_uWidthF32, Width);
+                _gl.Uniform1(_uHeightF32, Height);
+                _gl.Uniform1(_uXMinF32, (float)xMin);
+                _gl.Uniform1(_uYMinF32, (float)yMin);
+                _gl.Uniform1(_uXMaxF32, (float)xMax);
+                _gl.Uniform1(_uYMaxF32, (float)yMax);
+                _gl.Uniform1(_uMaxIterationsF32, MaxIterations);
             }
             else
             {
-                _kernelF64(totalPixels, _deviceBuffer.View,
-                    Width, Height,
-                    xMin, yMin, xMax, yMax,
-                    MaxIterations);
+                _gl.UseProgram(_computeProgramF64);
+                _gl.Uniform1(_uWidthF64, Width);
+                _gl.Uniform1(_uHeightF64, Height);
+                _gl.Uniform1(_uXMinF64, xMin);
+                _gl.Uniform1(_uYMinF64, yMin);
+                _gl.Uniform1(_uXMaxF64, xMax);
+                _gl.Uniform1(_uYMaxF64, yMax);
+                _gl.Uniform1(_uMaxIterationsF64, MaxIterations);
             }
 
-            long synchronizeStart = Stopwatch.GetTimestamp();
-            _accelerator.Synchronize();
-            long readbackStart = Stopwatch.GetTimestamp();
+            // Local workgroup size is 16x16, calculate total groups needed
+            uint numGroupsX = (uint)Math.Ceiling(Width / 16.0);
+            uint numGroupsY = (uint)Math.Ceiling(Height / 16.0);
 
-            _deviceBuffer.CopyToCPU(_cpuBuffer);
+            _gl.DispatchCompute(numGroupsX, numGroupsY, 1);
+            
+            long synchronizeStart = Stopwatch.GetTimestamp();
+            
+            // Ensure the computation finishes and data is available for rendering
+            _gl.MemoryBarrier(MemoryBarrierMask.ShaderImageAccessBarrierBit);
+            
             long end = Stopwatch.GetTimestamp();
 
+            // Calculate duration of phases. Readback phase is now 0 as it's purely on-GPU
+            double kernelDispatchMs = Stopwatch.GetElapsedTime(dispatchStart, synchronizeStart).TotalMilliseconds;
+            double synchronizeMs = Stopwatch.GetElapsedTime(synchronizeStart, end).TotalMilliseconds;
+
             return new HeightFieldFrame(
-                _cpuBuffer!,
+                null, // No CPU data buffer anymore!
                 Width,
                 Height,
                 PrecisionStatus,
-                Stopwatch.GetElapsedTime(dispatchStart, synchronizeStart).TotalMilliseconds,
-                Stopwatch.GetElapsedTime(synchronizeStart, readbackStart).TotalMilliseconds,
-                Stopwatch.GetElapsedTime(readbackStart, end).TotalMilliseconds,
-                GC.GetTotalAllocatedBytes(false) - allocatedBefore);
+                kernelDispatchMs,
+                synchronizeMs,
+                0.0, // readback is exactly 0.0 ms now!
+                GC.GetTotalAllocatedBytes(false) - allocatedBefore)
+                { TextureHandle = targetTextureHandle, BoundsBufferHandle = _ssboMinMax };
         }
         finally
         {
@@ -365,15 +229,12 @@ public sealed class MandelbrotCompute : IDisposable
     {
         Width  = width;
         Height = height;
-        // Force buffer reallocate on next compute
-        _deviceBuffer?.Dispose();
-        _deviceBuffer = null;
     }
 
     public void Dispose()
     {
-        _deviceBuffer?.Dispose();
-        _accelerator.Dispose();
-        _context.Dispose();
+        _gl.DeleteProgram(_computeProgramF32);
+        _gl.DeleteProgram(_computeProgramF64);
+        _gl.DeleteBuffer(_ssboMinMax);
     }
 }
