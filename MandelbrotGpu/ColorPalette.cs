@@ -15,35 +15,32 @@ public static class ColorPalette
         _ => GenerateVibrantPalette(size)
     };
 
+    public static float GetPaletteCycles(int paletteIndex) => paletteIndex switch
+    {
+        0 => 18f,
+        1 => 10f,
+        2 => 22f,
+        3 => 26f,
+        _ => 14f
+    };
+
     /// <summary>
     /// Generate a smooth, vivid color palette using cosine gradients.
     /// Returns float[size * 3] as RGB triplets in [0..1].
     /// </summary>
     public static float[] GenerateVibrantPalette(int size = 1024)
     {
-        float[] palette = new float[size * 3];
-
-        for (int i = 0; i < size; i++)
-        {
-            float t = (float)i / size;
-
-            // Cosine-based gradient: a + b * cos(2π * (c * t + d))
-            // Using carefully tuned coefficients for a rich, multi-hue gradient
-            float r = CosineGradient(t, 0.5f, 0.5f, 1.0f, 0.00f);
-            float g = CosineGradient(t, 0.5f, 0.5f, 1.0f, 0.33f);
-            float b = CosineGradient(t, 0.5f, 0.5f, 1.0f, 0.67f);
-
-            // Apply power curve for richer darks
-            r = MathF.Pow(r, 0.8f);
-            g = MathF.Pow(g, 0.8f);
-            b = MathF.Pow(b, 0.8f);
-
-            palette[i * 3 + 0] = Math.Clamp(r, 0f, 1f);
-            palette[i * 3 + 1] = Math.Clamp(g, 0f, 1f);
-            palette[i * 3 + 2] = Math.Clamp(b, 0f, 1f);
-        }
-
-        return palette;
+        return GenerateGradientPalette(
+            size,
+            (0.00f, 0.02f, 0.02f, 0.07f),
+            (0.12f, 0.12f, 0.05f, 0.32f),
+            (0.24f, 0.05f, 0.26f, 0.78f),
+            (0.38f, 0.02f, 0.72f, 0.92f),
+            (0.52f, 0.16f, 0.90f, 0.42f),
+            (0.66f, 0.92f, 0.84f, 0.18f),
+            (0.80f, 0.98f, 0.42f, 0.14f),
+            (0.92f, 0.82f, 0.10f, 0.45f),
+            (1.00f, 0.98f, 0.94f, 0.98f));
     }
 
     /// <summary>
@@ -101,16 +98,61 @@ public static class ColorPalette
     /// </summary>
     public static float[] GenerateOceanPalette(int size = 1024)
     {
+        return GenerateGradientPalette(
+            size,
+            (0.00f, 0.01f, 0.03f, 0.09f),
+            (0.16f, 0.02f, 0.12f, 0.32f),
+            (0.32f, 0.02f, 0.36f, 0.62f),
+            (0.48f, 0.07f, 0.72f, 0.84f),
+            (0.62f, 0.18f, 0.90f, 0.70f),
+            (0.76f, 0.92f, 0.90f, 0.56f),
+            (0.88f, 0.98f, 0.62f, 0.34f),
+            (1.00f, 0.96f, 0.96f, 0.99f));
+    }
+
+    /// <summary>
+    /// Generate a neon/synthwave themed palette (electric purple/pink/cyan).
+    /// </summary>
+    public static float[] GenerateNeonPalette(int size = 1024)
+    {
+        return GenerateGradientPalette(
+            size,
+            (0.00f, 0.02f, 0.01f, 0.06f),
+            (0.10f, 0.18f, 0.02f, 0.34f),
+            (0.24f, 0.54f, 0.08f, 0.80f),
+            (0.38f, 0.98f, 0.14f, 0.72f),
+            (0.52f, 1.00f, 0.44f, 0.22f),
+            (0.66f, 0.95f, 0.92f, 0.22f),
+            (0.80f, 0.08f, 0.98f, 0.88f),
+            (0.92f, 0.10f, 0.48f, 1.00f),
+            (1.00f, 0.99f, 0.99f, 1.00f));
+    }
+
+    private static float CosineGradient(float t, float a, float b, float c, float d)
+    {
+        return a + b * MathF.Cos(2f * MathF.PI * (c * t + d));
+    }
+
+    private static float[] GenerateGradientPalette(int size, params (float Position, float R, float G, float B)[] stops)
+    {
         float[] palette = new float[size * 3];
 
         for (int i = 0; i < size; i++)
         {
-            float t = (float)i / size;
+            float t = i / (float)(size - 1);
+            int stopIndex = 0;
 
-            // Deep blue → cyan → teal → white
-            float r = CosineGradient(t, 0.2f, 0.3f, 1.5f, 0.75f);
-            float g = CosineGradient(t, 0.3f, 0.5f, 1.2f, 0.45f);
-            float b = CosineGradient(t, 0.5f, 0.5f, 0.8f, 0.15f);
+            while (stopIndex < stops.Length - 2 && t > stops[stopIndex + 1].Position)
+                stopIndex++;
+
+            var start = stops[stopIndex];
+            var end = stops[Math.Min(stopIndex + 1, stops.Length - 1)];
+            float span = Math.Max(0.0001f, end.Position - start.Position);
+            float localT = Math.Clamp((t - start.Position) / span, 0f, 1f);
+
+            float r = Lerp(start.R, end.R, localT);
+            float g = Lerp(start.G, end.G, localT);
+            float b = Lerp(start.B, end.B, localT);
 
             palette[i * 3 + 0] = Math.Clamp(r, 0f, 1f);
             palette[i * 3 + 1] = Math.Clamp(g, 0f, 1f);
@@ -120,38 +162,9 @@ public static class ColorPalette
         return palette;
     }
 
-    /// <summary>
-    /// Generate a neon/synthwave themed palette (electric purple/pink/cyan).
-    /// </summary>
-    public static float[] GenerateNeonPalette(int size = 1024)
+    private static float Lerp(float start, float end, float amount)
     {
-        float[] palette = new float[size * 3];
-
-        for (int i = 0; i < size; i++)
-        {
-            float t = (float)i / size;
-
-            // Purple → hot pink → cyan → electric blue
-            float r = CosineGradient(t, 0.5f, 0.5f, 2.0f, 0.50f);
-            float g = CosineGradient(t, 0.2f, 0.4f, 1.5f, 0.10f);
-            float b = CosineGradient(t, 0.6f, 0.4f, 1.0f, 0.80f);
-
-            // Boost saturation
-            r = MathF.Pow(Math.Clamp(r, 0f, 1f), 0.7f);
-            g = MathF.Pow(Math.Clamp(g, 0f, 1f), 0.9f);
-            b = MathF.Pow(Math.Clamp(b, 0f, 1f), 0.6f);
-
-            palette[i * 3 + 0] = r;
-            palette[i * 3 + 1] = g;
-            palette[i * 3 + 2] = b;
-        }
-
-        return palette;
-    }
-
-    private static float CosineGradient(float t, float a, float b, float c, float d)
-    {
-        return a + b * MathF.Cos(2f * MathF.PI * (c * t + d));
+        return start + ((end - start) * amount);
     }
 
     /// <summary>

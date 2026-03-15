@@ -75,8 +75,17 @@ vec3 samplePalette(float value)
     if (value <= 0.0)
         return vec3(0.0);
 
-    float scaledT = fract(value * uPaletteCycles);
-    return texture(uPalette, vec2(scaledT, 0.5)).rgb;
+    float normalizedValue = clamp(value, 0.0, 1.0);
+    float emphasizedValue = mix(normalizedValue, sqrt(normalizedValue), 0.68);
+    float primaryBand = emphasizedValue * uPaletteCycles;
+    float secondaryBand = (emphasizedValue * emphasizedValue * 0.75 + normalizedValue * 1.6) * (uPaletteCycles * 0.45);
+    float paletteT = fract(mix(fract(primaryBand), fract(secondaryBand), 0.24));
+
+    vec3 paletteColor = texture(uPalette, vec2(paletteT, 0.5)).rgb;
+    float contour = smoothstep(0.12, 0.88, fract(primaryBand * 2.1 + secondaryBand));
+    paletteColor *= 0.9 + contour * 0.16;
+
+    return clamp(paletteColor, 0.0, 1.0);
 }
 
 void main()

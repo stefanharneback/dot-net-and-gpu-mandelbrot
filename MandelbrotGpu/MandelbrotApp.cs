@@ -2,6 +2,8 @@ using System.Diagnostics;
 using System.Numerics;
 using System.Threading;
 using System.Windows;
+using System.Windows.Media;
+using System.Windows.Threading;
 using Silk.NET.Input;
 using Silk.NET.Maths;
 using Silk.NET.OpenGL;
@@ -19,6 +21,9 @@ public sealed class MandelbrotApp : IDisposable
     private const int LargeIterationThreshold = 1000;
     private const int IterationLinearStep = 128;
     private const int MaxIterationLimit = 2_000_000;
+    private const int MinimumHudWidth = 360;
+    private const int PreferredHudWidth = 520;
+    private const int FallbackHudWidth = 300;
 
     private readonly ResolutionTier[] _resolutionTiers =
     [
@@ -33,7 +38,7 @@ public sealed class MandelbrotApp : IDisposable
 
     private readonly Camera _camera = new();
     private readonly string[] _paletteNames = ["Vibrant", "Fire", "Ocean", "Neon"];
-    private readonly object _settingsWindowLock = new();
+    private readonly object _hudWindowLock = new();
 
     private IWindow _window = null!;
     private GL _gl = null!;
@@ -55,6 +60,7 @@ public sealed class MandelbrotApp : IDisposable
 
     private float[] _palette = null!;
     private int _currentPalette;
+    private float _paletteCycles = ColorPalette.GetPaletteCycles(0);
     private float _heightScale = 0.6f;
     private bool _needsRecompute = true;
     private bool _paletteDirty = true;
@@ -68,8 +74,11 @@ public sealed class MandelbrotApp : IDisposable
     private int _frameCount;
     private double _fpsTimer;
 
+    private StartupLayout _startupLayout;
     private SettingsHUD? _settingsHud;
-    private Thread? _settingsThread;
+    private StatusHUD? _statusHud;
+    private Application? _hudApplication;
+    private Thread? _hudThread;
     private volatile bool _isHudStarting;
 
     public MandelbrotApp()
@@ -86,6 +95,8 @@ public sealed class MandelbrotApp : IDisposable
 
     public string CurrentPaletteName => _paletteNames[_currentPalette];
 
+    public int ComputeResolution => _compute?.Width ?? _performanceSettings.ComputeResolution;
+
     public float HeightScale => _heightScale;
 
     public float FPS => _fps;
@@ -98,10 +109,15 @@ public sealed class MandelbrotApp : IDisposable
 
     public PrecisionMode CurrentPrecisionMode => _compute?.CurrentPrecisionMode ?? PrecisionMode.Auto;
 
+    public string CurrentPrecisionStatus => _currentFrame?.PrecisionMode ?? _compute?.PrecisionStatus ?? PrecisionMode.Auto.ToString();
+
     public void Run()
     {
+        _startupLayout = CalculateStartupLayout();
+
         var options = WindowOptions.Default;
-        options.Size = new Vector2D<int>(1600, 900);
+        options.Size = new Vector2D<int>(_startupLayout.MainSize, _startupLayout.MainSize);
+        options.Position = new Vector2D<int>(_startupLayout.MainLeft, _startupLayout.MainTop);
         options.Title = "GPU Mandelbrot 3D Explorer";
         options.VSync = _performanceSettings.VSyncEnabled;
         options.PreferredDepthBufferBits = 24;
@@ -129,6 +145,7 @@ public sealed class MandelbrotApp : IDisposable
 
         _compute = new MandelbrotCompute(_performanceSettings.ComputeResolution, _performanceSettings.ComputeResolution);
         _palette = ColorPalette.GeneratePalette(_currentPalette);
+        _paletteCycles = ColorPalette.GetPaletteCycles(_currentPalette);
 
         _terrainShaderProgram = CreateShaderProgram(Shaders.TerrainVertexShader, Shaders.TerrainFragmentShader);
         _gridShaderProgram = CreateShaderProgram(Shaders.GridVertexShader, Shaders.GridFragmentShader);
@@ -275,6 +292,7 @@ public sealed class MandelbrotApp : IDisposable
             case Key.C:
                 _currentPalette = (_currentPalette + 1) % _paletteNames.Length;
                 _palette = ColorPalette.GeneratePalette(_currentPalette);
+                _paletteCycles = ColorPalette.GetPaletteCycles(_currentPalette);
                 _paletteDirty = true;
                 Console.WriteLine($"Palette: {_paletteNames[_currentPalette]}");
                 break;
@@ -289,7 +307,7 @@ public sealed class MandelbrotApp : IDisposable
                 break;
 
             case Key.H:
-                FocusSettingsWindow();
+                FocusHudWindows();
                 break;
 
             case Key.L:
@@ -412,6 +430,7 @@ public sealed class MandelbrotApp : IDisposable
             _camera.Position,
             _currentFrame,
             _heightScale,
+            _paletteCycles,
             _performanceSettings.ShadingMode,
             _wireframeMode);
 
@@ -624,26 +643,26 @@ public sealed class MandelbrotApp : IDisposable
             return;
 
         if (_performanceSettings.HudEnabled)
-            ShowSettingsWindow();
+            ShowHudWindows();
         else
-            CloseSettingsWindow();
+            CloseHudWindows();
     }
 
-    private void FocusSettingsWindow()
+    private void FocusHudWindows()
     {
         _performanceSettings = _performanceSettings with { HudEnabled = true };
-        ShowSettingsWindow();
-        Console.WriteLine("HUD focused");
+        ShowHudWindows();
+        Console.WriteLine("HUD windows focused");
     }
 
-    private void ShowSettingsWindow()
+    private void ShowHudWindows()
     {
-        lock (_settingsWindowLock)
+        lock (_hudWindowLock)
         {
-            if (_settingsHud != null)
+            if (_settingsHud != null && _statusHud != null)
             {
-                SettingsHUD hud = _settingsHud;
-                hud.Dispatcher.BeginInvoke(new Action(() => hud.Activate()));
+                _statusHud.FocusHud();
+                _settingsHud.FocusHud();
                 return;
             }
 
@@ -651,36 +670,69 @@ public sealed class MandelbrotApp : IDisposable
                 return;
 
             _isHudStarting = true;
-            _settingsThread = new Thread(() =>
+            _hudThread = new Thread(() =>
             {
                 try
                 {
-                    var app = new Application();
-                    var hud = new SettingsHUD(this, _compute);
-                    hud.Closed += (_, _) =>
+                    RenderOptions.ProcessRenderMode = System.Windows.Interop.RenderMode.SoftwareOnly;
+
+                    var app = new Application
                     {
-                        lock (_settingsWindowLock)
-                        {
-                            _settingsHud = null;
-                            _settingsThread = null;
-                            _isHudStarting = false;
-                        }
+                        ShutdownMode = ShutdownMode.OnExplicitShutdown
                     };
 
-                    lock (_settingsWindowLock)
+                    var statusHud = new StatusHUD(this, _compute);
+                    var settingsHud = new SettingsHUD(this, _compute);
+                    ApplyHudLayout(statusHud, settingsHud);
+
+                    void HandleWindowClosed()
                     {
-                        _settingsHud = hud;
+                        bool shouldShutdown;
+                        lock (_hudWindowLock)
+                        {
+                            if (ReferenceEquals(_statusHud, statusHud))
+                                _statusHud = null;
+
+                            if (ReferenceEquals(_settingsHud, settingsHud))
+                                _settingsHud = null;
+
+                            shouldShutdown = _statusHud == null && _settingsHud == null;
+                            if (shouldShutdown)
+                            {
+                                _hudApplication = null;
+                                _hudThread = null;
+                                _isHudStarting = false;
+                            }
+                        }
+
+                        if (shouldShutdown && !app.Dispatcher.HasShutdownStarted)
+                            app.Dispatcher.BeginInvokeShutdown(DispatcherPriority.Background);
+                    }
+
+                    statusHud.Closed += (_, _) => HandleWindowClosed();
+                    settingsHud.Closed += (_, _) => HandleWindowClosed();
+
+                    lock (_hudWindowLock)
+                    {
+                        _hudApplication = app;
+                        _statusHud = statusHud;
+                        _settingsHud = settingsHud;
+                        _hudThread = Thread.CurrentThread;
                         _isHudStarting = false;
                     }
 
-                    app.Run(hud);
+                    statusHud.Show();
+                    settingsHud.Show();
+                    app.Run();
                 }
                 catch (Exception ex)
                 {
-                    lock (_settingsWindowLock)
+                    lock (_hudWindowLock)
                     {
+                        _hudApplication = null;
+                        _statusHud = null;
                         _settingsHud = null;
-                        _settingsThread = null;
+                        _hudThread = null;
                         _isHudStarting = false;
                     }
 
@@ -688,22 +740,32 @@ public sealed class MandelbrotApp : IDisposable
                 }
             });
 
-            _settingsThread.SetApartmentState(ApartmentState.STA);
-            _settingsThread.IsBackground = true;
-            _settingsThread.Start();
+            _hudThread.SetApartmentState(ApartmentState.STA);
+            _hudThread.IsBackground = true;
+            _hudThread.Start();
         }
     }
 
-    private void CloseSettingsWindow()
+    private void CloseHudWindows()
     {
-        SettingsHUD? hud;
-        lock (_settingsWindowLock)
-            hud = _settingsHud;
+        Application? hudApplication;
+        StatusHUD? statusHud;
+        SettingsHUD? settingsHud;
+        lock (_hudWindowLock)
+        {
+            hudApplication = _hudApplication;
+            statusHud = _statusHud;
+            settingsHud = _settingsHud;
+        }
 
-        if (hud == null)
+        if (hudApplication == null)
             return;
 
-        hud.Dispatcher.BeginInvoke(new Action(hud.BeginClose));
+        hudApplication.Dispatcher.BeginInvoke(new Action(() =>
+        {
+            statusHud?.BeginClose();
+            settingsHud?.BeginClose();
+        }));
     }
 
     private unsafe void CreateGridOverlay()
@@ -754,7 +816,7 @@ public sealed class MandelbrotApp : IDisposable
 
     private void OnClosing()
     {
-        CloseSettingsWindow();
+        CloseHudWindows();
         _terrainRenderer?.Dispose();
 
         _gl.DeleteVertexArray(_gridVao);
@@ -813,6 +875,70 @@ public sealed class MandelbrotApp : IDisposable
         _needsRecompute = true;
     }
 
+    private StartupLayout CalculateStartupLayout()
+    {
+        Rect workArea = SystemParameters.WorkArea;
+        double screenWidth = workArea.Width;
+        double screenHeight = workArea.Height;
+        double outerMargin = Math.Max(16, Math.Round(screenHeight * 0.02));
+        double gap = Math.Max(14, Math.Round(screenHeight * 0.015));
+
+        double preferredHudWidth = Math.Clamp(screenWidth * 0.27, MinimumHudWidth, PreferredHudWidth);
+        double desiredMainSize = Math.Min(screenHeight * 0.8, screenHeight - (2 * outerMargin));
+        double centeredMainLimit = screenWidth - (2 * (preferredHudWidth + gap + outerMargin));
+        double mainSize = Math.Min(desiredMainSize, centeredMainLimit);
+
+        if (mainSize < 440)
+            mainSize = Math.Min(desiredMainSize, screenWidth - (2 * (FallbackHudWidth + gap + outerMargin)));
+
+        mainSize = Math.Max(420, Math.Min(mainSize, screenHeight - (2 * outerMargin)));
+
+        double sideSpace = (screenWidth - mainSize) / 2.0;
+        double maxHudWidth = sideSpace - outerMargin - gap;
+        double hudWidth = Math.Min(preferredHudWidth, maxHudWidth);
+        if (hudWidth < FallbackHudWidth)
+        {
+            mainSize = Math.Min(mainSize, screenWidth - (2 * (FallbackHudWidth + gap + outerMargin)));
+            sideSpace = (screenWidth - mainSize) / 2.0;
+            maxHudWidth = sideSpace - outerMargin - gap;
+            hudWidth = Math.Max(240, maxHudWidth);
+        }
+
+        double mainLeft = workArea.Left + ((workArea.Width - mainSize) / 2.0);
+        double mainTop = workArea.Top + ((workArea.Height - mainSize) / 2.0);
+        double hudLeft = Math.Max(workArea.Left + outerMargin, mainLeft - gap - hudWidth);
+        double totalHudHeight = workArea.Height - (2 * outerMargin);
+        double upperHudHeight = Math.Floor((totalHudHeight - gap) * 0.5);
+        double lowerHudTop = workArea.Top + outerMargin + upperHudHeight + gap;
+        double lowerHudHeight = totalHudHeight - upperHudHeight - gap;
+
+        return new StartupLayout(
+            (int)Math.Round(mainLeft),
+            (int)Math.Round(mainTop),
+            (int)Math.Round(mainSize),
+            (int)Math.Round(hudLeft),
+            (int)Math.Round(workArea.Top + outerMargin),
+            (int)Math.Round(hudWidth),
+            (int)Math.Round(upperHudHeight),
+            (int)Math.Round(lowerHudTop),
+            (int)Math.Round(lowerHudHeight));
+    }
+
+    private void ApplyHudLayout(StatusHUD statusHud, SettingsHUD settingsHud)
+    {
+        statusHud.ApplyWindowBounds(
+            _startupLayout.HudLeft,
+            _startupLayout.StatusHudTop,
+            _startupLayout.HudWidth,
+            _startupLayout.StatusHudHeight);
+
+        settingsHud.ApplyWindowBounds(
+            _startupLayout.HudLeft,
+            _startupLayout.SettingsHudTop,
+            _startupLayout.HudWidth,
+            _startupLayout.SettingsHudHeight);
+    }
+
     private (int Min, int Default, int Max) GetTierBounds(PerformanceProfile profile) => profile switch
     {
         PerformanceProfile.Latency => (0, 1, 2),
@@ -823,6 +949,17 @@ public sealed class MandelbrotApp : IDisposable
     };
 
     private int GetDefaultTierIndex(PerformanceProfile profile) => GetTierBounds(profile).Default;
+
+    private readonly record struct StartupLayout(
+        int MainLeft,
+        int MainTop,
+        int MainSize,
+        int HudLeft,
+        int StatusHudTop,
+        int HudWidth,
+        int StatusHudHeight,
+        int SettingsHudTop,
+        int SettingsHudHeight);
 
     private static void PrintControls()
     {
@@ -837,7 +974,7 @@ public sealed class MandelbrotApp : IDisposable
         Console.WriteLine("║ Height scale: PageUp / PageDown                          ║");
         Console.WriteLine("║ Palette: C | Wireframe: F | Resolution tier: G           ║");
         Console.WriteLine("║ Precision: M | Profile: N | Shading: L                   ║");
-        Console.WriteLine("║ Adaptive res: O | HUD focus: H | VSync: V                ║");
+        Console.WriteLine("║ Adaptive res: O | Focus HUDs: H | VSync: V               ║");
         Console.WriteLine("║ Print coords: P                                          ║");
         Console.WriteLine("║ Presets: 1..6 | Reset: R | Exit: Esc                     ║");
         Console.WriteLine("╚═══════════════════════════════════════════════════════════╝");
@@ -846,7 +983,7 @@ public sealed class MandelbrotApp : IDisposable
 
     public void Dispose()
     {
-        CloseSettingsWindow();
+        CloseHudWindows();
         _compute?.Dispose();
         _input?.Dispose();
         _window?.Dispose();

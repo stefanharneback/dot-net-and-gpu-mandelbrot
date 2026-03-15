@@ -12,7 +12,8 @@ A real-time, GPU-accelerated 3D Mandelbrot set visualization built with **.NET 1
 - **Height-Field Terrain Renderer** — A static terrain grid is displaced in the vertex shader from a streamed height texture
 - **GPU-Side Lighting & Palette Lookup** — Normals and palette colors are derived in shaders instead of CPU mesh generation
 - **Performance Profiles** — `Latency`, `Balanced`, `Quality`, and `Screenshot` modes tune compute resolution, render mesh density, shading, HUD, and VSync
-- **4 Color Palettes** — Vibrant, Fire, Ocean, and Neon palettes using cosine gradients
+- **Dual HUD Windows** — Separate live-status/performance and controls/settings windows stay readable during exploration
+- **4 Color Palettes** — Vibrant, Fire, Ocean, and Neon palettes tuned for stronger deep-zoom contrast and detail separation
 - **Interactive Camera** — Orbit, zoom, and pan with mouse; navigate the fractal with keyboard
 - **Real-time Fractal Exploration** — Pan and zoom into the Mandelbrot set in real-time
 - **Wireframe Mode** — Toggle wireframe rendering to see the mesh structure
@@ -75,7 +76,7 @@ This is intentionally a wrapper around `dotnet publish MandelbrotGpu/MandelbrotG
 | Cycle performance profile | `N` |
 | Toggle shading mode | `L` |
 | Toggle adaptive resolution | `O` |
-| Focus HUD | `H` |
+| Focus HUD windows | `H` |
 | Toggle VSync | `V` |
 | Reset view | `R` |
 | Exit | `Esc` |
@@ -90,10 +91,12 @@ MandelbrotGpu/
 ├── HeightFieldRenderer.cs # Static grid renderer + height/palette texture uploads
 ├── TerrainGridCache.cs    # Builds reusable XY terrain grids and index buffers
 ├── HeightFieldFrame.cs    # Compute result + timing metadata for the current height field
+├── HudWindowBase.cs       # Shared WPF HUD styling, key forwarding, and persistence behavior
+├── StatusHUD.cs           # Live parameters, render state, and performance HUD window
 ├── PerformanceProfile.cs  # Performance profiles, shading modes, and runtime settings
 ├── PerformanceMetrics.cs  # Latest timing/instrumentation snapshot
 ├── Camera.cs            # Orbital camera with spherical coordinates
-├── ColorPalette.cs      # Cosine-gradient color palette generator
+├── ColorPalette.cs      # High-contrast palette generator and palette-cycle tuning
 └── Shaders.cs           # GLSL vertex + fragment shaders
 ```
 

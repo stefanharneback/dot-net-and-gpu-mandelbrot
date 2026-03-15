@@ -189,6 +189,7 @@ public sealed unsafe class HeightFieldRenderer : IDisposable
         Vector3 viewPosition,
         HeightFieldFrame frame,
         float heightScale,
+        float paletteCycles,
         ShadingMode shadingMode,
         bool wireframeMode)
     {
@@ -208,7 +209,7 @@ public sealed unsafe class HeightFieldRenderer : IDisposable
         if (_gridStepLocation >= 0)
             _gl.Uniform2(_gridStepLocation, _gridStep.X, _gridStep.Y);
         if (_paletteCyclesLocation >= 0)
-            _gl.Uniform1(_paletteCyclesLocation, 8f);
+            _gl.Uniform1(_paletteCyclesLocation, paletteCycles);
         if (_shadingModeLocation >= 0)
             _gl.Uniform1(_shadingModeLocation, shadingMode == ShadingMode.Full ? 1 : 0);
 

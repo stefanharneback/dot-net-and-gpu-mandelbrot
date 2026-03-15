@@ -1,5 +1,6 @@
 ## .NET
 bin/
+bin-*/
 obj/
 *.user
 *.suo
