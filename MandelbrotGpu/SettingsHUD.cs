@@ -9,6 +9,7 @@ public sealed class SettingsHUD : HudWindowBase
     private readonly DispatcherTimer _timer;
 
     private readonly TextBlock _profileValue;
+    private readonly TextBlock _fractalValue;
     private readonly TextBlock _precisionModeValue;
     private readonly TextBlock _iterationsValue;
     private readonly TextBlock _paletteValue;
@@ -30,6 +31,7 @@ public sealed class SettingsHUD : HudWindowBase
         int settingsRow = 0;
         AddHeaderRow(settingsGrid, ref settingsRow, "SETTING", "CURRENT VALUE", "KEYS");
         _profileValue = AddValueRow(settingsGrid, ref settingsRow, "Performance profile", "N");
+        _fractalValue = AddValueRow(settingsGrid, ref settingsRow, "Fractal set", "T");
         _precisionModeValue = AddValueRow(settingsGrid, ref settingsRow, "Precision selector", "M");
         _iterationsValue = AddValueRow(settingsGrid, ref settingsRow, "Iterations", "I / K", monospaceValue: true);
         _paletteValue = AddValueRow(settingsGrid, ref settingsRow, "Palette", "C");
@@ -41,7 +43,7 @@ public sealed class SettingsHUD : HudWindowBase
         _vsyncValue = AddValueRow(settingsGrid, ref settingsRow, "VSync", "V");
 
         var settingsPanel = new StackPanel { Orientation = Orientation.Vertical };
-        settingsPanel.Children.Add(CreateNote("Hold Shift while using +/- for finer zoom adjustments. H focuses both HUD windows."));
+        settingsPanel.Children.Add(CreateNote("T cycles Mandelbrot, Julia, Burning Ship, Tricorn, and Celtic defaults. Hold Shift while using +/- for finer zoom adjustments. H focuses both HUD windows."));
         settingsPanel.Children.Add(settingsGrid);
         root.Children.Add(CreateCard("Adjustable Settings", settingsPanel));
 
@@ -88,6 +90,7 @@ public sealed class SettingsHUD : HudWindowBase
         PerformanceSettings settings = App.CurrentPerformanceSettings;
 
         _profileValue.Text = settings.Profile.ToString();
+        _fractalValue.Text = App.CurrentFractalName;
         _precisionModeValue.Text = App.CurrentPrecisionMode.ToString();
         _iterationsValue.Text = _compute.MaxIterations.ToString("N0");
         _paletteValue.Text = App.CurrentPaletteName;

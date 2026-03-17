@@ -11,6 +11,8 @@ public sealed class StatusHUD : HudWindowBase
     private readonly TextBlock _centerXValue;
     private readonly TextBlock _centerYValue;
     private readonly TextBlock _zoomValue;
+    private readonly TextBlock _fractalValue;
+    private readonly TextBlock _parameterValue;
     private readonly TextBlock _fpsValue;
     private readonly TextBlock _precisionValue;
     private readonly TextBlock _iterationsValue;
@@ -49,6 +51,8 @@ public sealed class StatusHUD : HudWindowBase
         _centerXValue = AddValueRow(statusGrid, ref statusRow, "Center X", monospaceValue: true);
         _centerYValue = AddValueRow(statusGrid, ref statusRow, "Center Y", monospaceValue: true);
         _zoomValue = AddValueRow(statusGrid, ref statusRow, "Zoom", monospaceValue: true);
+        _fractalValue = AddValueRow(statusGrid, ref statusRow, "Fractal set");
+        _parameterValue = AddValueRow(statusGrid, ref statusRow, "Set parameter", monospaceValue: true);
         _fpsValue = AddValueRow(statusGrid, ref statusRow, "FPS", monospaceValue: true);
         _precisionValue = AddValueRow(statusGrid, ref statusRow, "Active precision");
         _iterationsValue = AddValueRow(statusGrid, ref statusRow, "Iterations", monospaceValue: true);
@@ -104,6 +108,8 @@ public sealed class StatusHUD : HudWindowBase
         _centerXValue.Text = _compute.CenterX.ToString("G17");
         _centerYValue.Text = _compute.CenterY.ToString("G17");
         _zoomValue.Text = $"{_compute.Zoom:0.###e+0}x";
+        _fractalValue.Text = App.CurrentFractalName;
+        _parameterValue.Text = App.CurrentFractalParameterSummary;
         _fpsValue.Text = $"{App.FPS:F0}";
         _precisionValue.Text = App.CurrentPrecisionStatus;
         _iterationsValue.Text = _compute.MaxIterations.ToString("N0");

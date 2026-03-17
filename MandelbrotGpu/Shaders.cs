@@ -95,6 +95,12 @@ vec3 samplePalette(float value)
 
 void main()
 {
+    if (bMinVal == 0xFFFFFFFFu || bMaxVal == 0u)
+    {
+        FragColor = vec4(0.0, 0.0, 0.0, 1.0);
+        return;
+    }
+
     float minVal = uintBitsToFloat(bMinVal);
     float maxVal = uintBitsToFloat(bMaxVal);
 
@@ -186,9 +192,38 @@ uniform float uYMin;
 uniform float uXMax;
 uniform float uYMax;
 uniform int uMaxIterations;
+uniform int uFractalType;
+uniform vec2 uJuliaC;
 
 shared uint localMin;
 shared uint localMax;
+
+const int FRACTAL_MANDELBROT = 0;
+const int FRACTAL_JULIA = 1;
+const int FRACTAL_BURNING_SHIP = 2;
+const int FRACTAL_TRICORN = 3;
+const int FRACTAL_CELTIC = 4;
+
+vec2 iterateFractal(vec2 z, vec2 c, int fractalType)
+{
+    if (fractalType == FRACTAL_BURNING_SHIP)
+    {
+        vec2 absZ = abs(z);
+        return vec2(
+            absZ.x * absZ.x - absZ.y * absZ.y + c.x,
+            2.0 * absZ.x * absZ.y + c.y);
+    }
+
+    float real = z.x * z.x - z.y * z.y;
+    float imaginary = 2.0 * z.x * z.y;
+
+    if (fractalType == FRACTAL_TRICORN)
+        imaginary = -imaginary;
+    else if (fractalType == FRACTAL_CELTIC)
+        real = abs(real);
+
+    return vec2(real + c.x, imaginary + c.y);
+}
 
 void main()
 {
@@ -209,25 +244,29 @@ void main()
 
     float x0 = uXMin + (uXMax - uXMin) * px;
     float y0 = uYMin + (uYMax - uYMin) * py;
+    vec2 coord = vec2(x0, y0);
+    vec2 c = uFractalType == FRACTAL_JULIA ? uJuliaC : coord;
+    vec2 z = uFractalType == FRACTAL_JULIA ? coord : vec2(0.0);
 
-    // --- Optimization 1: Cardioid and period-2 bulb rejection ---
-    float q = (x0 - 0.25) * (x0 - 0.25) + y0 * y0;
-    if (q * (q + (x0 - 0.25)) <= 0.25 * y0 * y0)
+    // Mandelbrot can reject its main cardioid and period-2 bulb before iterating.
+    if (uFractalType == FRACTAL_MANDELBROT)
     {
-        imageStore(uOutputImage, pixelCoords, vec4(0.0));
-        return;
-    }
-    float bx = x0 + 1.0;
-    if (bx * bx + y0 * y0 <= 0.0625)
-    {
-        imageStore(uOutputImage, pixelCoords, vec4(0.0));
-        return;
+        float q = (x0 - 0.25) * (x0 - 0.25) + y0 * y0;
+        if (q * (q + (x0 - 0.25)) <= 0.25 * y0 * y0)
+        {
+            imageStore(uOutputImage, pixelCoords, vec4(0.0));
+            return;
+        }
+
+        float bx = x0 + 1.0;
+        if (bx * bx + y0 * y0 <= 0.0625)
+        {
+            imageStore(uOutputImage, pixelCoords, vec4(0.0));
+            return;
+        }
     }
 
-    float x = 0.0;
-    float y = 0.0;
-    float xOld = 0.0;
-    float yOld = 0.0;
+    vec2 zOld = z;
     int iteration = 0;
     int periodCheck = 0;
 
@@ -235,45 +274,39 @@ void main()
     int unrolledLimit = uMaxIterations - 4;
     while (iteration < unrolledLimit)
     {
-        float xx = x * x, yy = y * y;
-        if (xx + yy > 4.0) break;
-        y = 2.0 * x * y + y0; x = xx - yy + x0; iteration++;
+        if (dot(z, z) > 4.0) break;
+        z = iterateFractal(z, c, uFractalType); iteration++;
 
-        xx = x * x; yy = y * y;
-        if (xx + yy > 4.0) break;
-        y = 2.0 * x * y + y0; x = xx - yy + x0; iteration++;
+        if (dot(z, z) > 4.0) break;
+        z = iterateFractal(z, c, uFractalType); iteration++;
 
-        xx = x * x; yy = y * y;
-        if (xx + yy > 4.0) break;
-        y = 2.0 * x * y + y0; x = xx - yy + x0; iteration++;
+        if (dot(z, z) > 4.0) break;
+        z = iterateFractal(z, c, uFractalType); iteration++;
 
-        xx = x * x; yy = y * y;
-        if (xx + yy > 4.0) break;
-        y = 2.0 * x * y + y0; x = xx - yy + x0; iteration++;
+        if (dot(z, z) > 4.0) break;
+        z = iterateFractal(z, c, uFractalType); iteration++;
 
         if (++periodCheck > 20)
         {
-            if (abs(x - xOld) < 1e-7 && abs(y - yOld) < 1e-7)
+            if (distance(z, zOld) < 1e-7)
             {
                 iteration = uMaxIterations;
                 break;
             }
-            xOld = x; yOld = y;
+            zOld = z;
             periodCheck = 0;
         }
     }
 
-    while (x * x + y * y <= 4.0 && iteration < uMaxIterations)
+    while (dot(z, z) <= 4.0 && iteration < uMaxIterations)
     {
-        float xTemp = x * x - y * y + x0;
-        y = 2.0 * x * y + y0;
-        x = xTemp;
+        z = iterateFractal(z, c, uFractalType);
         iteration++;
     }
 
     if (iteration < uMaxIterations)
     {
-        float zn = x * x + y * y;
+        float zn = dot(z, z);
         float log2zn = log2(zn) * 0.5;
         float nu = log2(log2zn);
         float value = (float(iteration) + 1.0 - nu) / float(uMaxIterations);
@@ -318,9 +351,38 @@ uniform double uYMin;
 uniform double uXMax;
 uniform double uYMax;
 uniform int uMaxIterations;
+uniform int uFractalType;
+uniform dvec2 uJuliaC;
 
 shared uint localMin;
 shared uint localMax;
+
+const int FRACTAL_MANDELBROT = 0;
+const int FRACTAL_JULIA = 1;
+const int FRACTAL_BURNING_SHIP = 2;
+const int FRACTAL_TRICORN = 3;
+const int FRACTAL_CELTIC = 4;
+
+dvec2 iterateFractal(dvec2 z, dvec2 c, int fractalType)
+{
+    if (fractalType == FRACTAL_BURNING_SHIP)
+    {
+        dvec2 absZ = abs(z);
+        return dvec2(
+            absZ.x * absZ.x - absZ.y * absZ.y + c.x,
+            2.0 * absZ.x * absZ.y + c.y);
+    }
+
+    double real = z.x * z.x - z.y * z.y;
+    double imaginary = 2.0 * z.x * z.y;
+
+    if (fractalType == FRACTAL_TRICORN)
+        imaginary = -imaginary;
+    else if (fractalType == FRACTAL_CELTIC)
+        real = abs(real);
+
+    return dvec2(real + c.x, imaginary + c.y);
+}
 
 void main()
 {
@@ -341,25 +403,28 @@ void main()
 
     double x0 = uXMin + (uXMax - uXMin) * px;
     double y0 = uYMin + (uYMax - uYMin) * py;
+    dvec2 coord = dvec2(x0, y0);
+    dvec2 c = uFractalType == FRACTAL_JULIA ? uJuliaC : coord;
+    dvec2 z = uFractalType == FRACTAL_JULIA ? coord : dvec2(0.0);
 
-    // --- Optimization 1: Cardioid and period-2 bulb rejection ---
-    double q = (x0 - 0.25) * (x0 - 0.25) + y0 * y0;
-    if (q * (q + (x0 - 0.25)) <= 0.25 * y0 * y0)
+    if (uFractalType == FRACTAL_MANDELBROT)
     {
-        imageStore(uOutputImage, pixelCoords, vec4(0.0));
-        return;
-    }
-    double bx = x0 + 1.0;
-    if (bx * bx + y0 * y0 <= 0.0625)
-    {
-        imageStore(uOutputImage, pixelCoords, vec4(0.0));
-        return;
+        double q = (x0 - 0.25) * (x0 - 0.25) + y0 * y0;
+        if (q * (q + (x0 - 0.25)) <= 0.25 * y0 * y0)
+        {
+            imageStore(uOutputImage, pixelCoords, vec4(0.0));
+            return;
+        }
+
+        double bx = x0 + 1.0;
+        if (bx * bx + y0 * y0 <= 0.0625)
+        {
+            imageStore(uOutputImage, pixelCoords, vec4(0.0));
+            return;
+        }
     }
 
-    double x = 0.0;
-    double y = 0.0;
-    double xOld = 0.0;
-    double yOld = 0.0;
+    dvec2 zOld = z;
     int iteration = 0;
     int periodCheck = 0;
 
@@ -367,45 +432,39 @@ void main()
     int unrolledLimit = uMaxIterations - 4;
     while (iteration < unrolledLimit)
     {
-        double xx = x * x, yy = y * y;
-        if (xx + yy > 4.0) break;
-        y = 2.0 * x * y + y0; x = xx - yy + x0; iteration++;
+        if (dot(z, z) > 4.0) break;
+        z = iterateFractal(z, c, uFractalType); iteration++;
 
-        xx = x * x; yy = y * y;
-        if (xx + yy > 4.0) break;
-        y = 2.0 * x * y + y0; x = xx - yy + x0; iteration++;
+        if (dot(z, z) > 4.0) break;
+        z = iterateFractal(z, c, uFractalType); iteration++;
 
-        xx = x * x; yy = y * y;
-        if (xx + yy > 4.0) break;
-        y = 2.0 * x * y + y0; x = xx - yy + x0; iteration++;
+        if (dot(z, z) > 4.0) break;
+        z = iterateFractal(z, c, uFractalType); iteration++;
 
-        xx = x * x; yy = y * y;
-        if (xx + yy > 4.0) break;
-        y = 2.0 * x * y + y0; x = xx - yy + x0; iteration++;
+        if (dot(z, z) > 4.0) break;
+        z = iterateFractal(z, c, uFractalType); iteration++;
 
         if (++periodCheck > 20)
         {
-            if (abs(x - xOld) < 1e-13 && abs(y - yOld) < 1e-13)
+            if (distance(z, zOld) < 1e-13)
             {
                 iteration = uMaxIterations;
                 break;
             }
-            xOld = x; yOld = y;
+            zOld = z;
             periodCheck = 0;
         }
     }
 
-    while (x * x + y * y <= 4.0 && iteration < uMaxIterations)
+    while (dot(z, z) <= 4.0 && iteration < uMaxIterations)
     {
-        double xTemp = x * x - y * y + x0;
-        y = 2.0 * x * y + y0;
-        x = xTemp;
+        z = iterateFractal(z, c, uFractalType);
         iteration++;
     }
 
     if (iteration < uMaxIterations)
     {
-        double zn = x * x + y * y;
+        double zn = dot(z, z);
         // fallback to float for log operations as double logic isn't strictly necessary for shading calculation
         double log2zn = log2(float(zn)) * 0.5;
         double nu = log2(float(log2zn));

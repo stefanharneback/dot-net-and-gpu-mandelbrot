@@ -11,20 +11,23 @@ public enum PrecisionMode
 }
 
 /// <summary>
-/// GPU-accelerated Mandelbrot set computation using OpenGL Compute Shaders.
+/// GPU-accelerated fractal set computation using OpenGL Compute Shaders.
 /// </summary>
 public sealed class MandelbrotCompute : IDisposable
 {
     public PrecisionMode CurrentPrecisionMode { get; set; } = PrecisionMode.Auto;
     public bool IsComputing { get; private set; }
-    
+
     // Zoom threshold: below this, float is accurate enough (fast), above we need double
     public const double FloatPrecisionZoomLimit = 500_000.0;
 
+    public FractalKind FractalType { get; set; } = FractalKind.Mandelbrot;
     public double CenterX { get; set; } = -0.5;
     public double CenterY { get; set; } = 0.0;
-    public double Zoom    { get; set; } = 1.0;
+    public double Zoom { get; set; } = 1.0;
     public int MaxIterations { get; set; } = 256;
+    public double JuliaConstantX { get; set; } = -0.8;
+    public double JuliaConstantY { get; set; } = 0.156;
     public int Width  { get; private set; }
     public int Height { get; private set; }
 
@@ -49,6 +52,8 @@ public sealed class MandelbrotCompute : IDisposable
     private readonly int _uXMaxF32;
     private readonly int _uYMaxF32;
     private readonly int _uMaxIterationsF32;
+    private readonly int _uFractalTypeF32;
+    private readonly int _uJuliaCF32;
 
     // Uniform locations for F64 shader
     private readonly int _uWidthF64;
@@ -58,6 +63,8 @@ public sealed class MandelbrotCompute : IDisposable
     private readonly int _uXMaxF64;
     private readonly int _uYMaxF64;
     private readonly int _uMaxIterationsF64;
+    private readonly int _uFractalTypeF64;
+    private readonly int _uJuliaCF64;
 
     public MandelbrotCompute(GL gl, int width, int height)
     {
@@ -76,6 +83,8 @@ public sealed class MandelbrotCompute : IDisposable
         _uXMaxF32 = _gl.GetUniformLocation(_computeProgramF32, "uXMax");
         _uYMaxF32 = _gl.GetUniformLocation(_computeProgramF32, "uYMax");
         _uMaxIterationsF32 = _gl.GetUniformLocation(_computeProgramF32, "uMaxIterations");
+        _uFractalTypeF32 = _gl.GetUniformLocation(_computeProgramF32, "uFractalType");
+        _uJuliaCF32 = _gl.GetUniformLocation(_computeProgramF32, "uJuliaC");
 
         // Fetch variable locations for FP64
         _uWidthF64 = _gl.GetUniformLocation(_computeProgramF64, "uWidth");
@@ -85,6 +94,8 @@ public sealed class MandelbrotCompute : IDisposable
         _uXMaxF64 = _gl.GetUniformLocation(_computeProgramF64, "uXMax");
         _uYMaxF64 = _gl.GetUniformLocation(_computeProgramF64, "uYMax");
         _uMaxIterationsF64 = _gl.GetUniformLocation(_computeProgramF64, "uMaxIterations");
+        _uFractalTypeF64 = _gl.GetUniformLocation(_computeProgramF64, "uFractalType");
+        _uJuliaCF64 = _gl.GetUniformLocation(_computeProgramF64, "uJuliaC");
 
         // Create SSBO for min/max tracking (2 uints)
         _ssboMinMax = _gl.GenBuffer();
@@ -93,7 +104,7 @@ public sealed class MandelbrotCompute : IDisposable
         unsafe { _gl.BufferData(BufferTargetARB.ShaderStorageBuffer, 2 * sizeof(uint), null, BufferUsageARB.DynamicCopy); }
         _gl.BindBuffer(BufferTargetARB.ShaderStorageBuffer, 0);
 
-        Console.WriteLine("Mandelbrot compute initialized with OpenGL Compute Shaders.");
+        Console.WriteLine("Fractal compute initialized with OpenGL Compute Shaders.");
     }
 
     private uint CreateComputeProgram(string source)
@@ -125,7 +136,7 @@ public sealed class MandelbrotCompute : IDisposable
     }
 
     /// <summary>
-    /// Computes the Mandelbrot set into the given texture using the fastest
+    /// Computes the current fractal set into the given texture using the fastest
     /// compute shader (FP32 or FP64) based on the current zoom level.
     /// </summary>
     public HeightFieldFrame Compute(uint targetTextureHandle)
@@ -178,6 +189,8 @@ public sealed class MandelbrotCompute : IDisposable
                 _gl.Uniform1(_uXMaxF32, (float)xMax);
                 _gl.Uniform1(_uYMaxF32, (float)yMax);
                 _gl.Uniform1(_uMaxIterationsF32, MaxIterations);
+                _gl.Uniform1(_uFractalTypeF32, (int)FractalType);
+                _gl.Uniform2(_uJuliaCF32, (float)JuliaConstantX, (float)JuliaConstantY);
             }
             else
             {
@@ -189,6 +202,8 @@ public sealed class MandelbrotCompute : IDisposable
                 _gl.Uniform1(_uXMaxF64, xMax);
                 _gl.Uniform1(_uYMaxF64, yMax);
                 _gl.Uniform1(_uMaxIterationsF64, MaxIterations);
+                _gl.Uniform1(_uFractalTypeF64, (int)FractalType);
+                _gl.Uniform2(_uJuliaCF64, JuliaConstantX, JuliaConstantY);
             }
 
             // Local workgroup size is 16x16, calculate total groups needed

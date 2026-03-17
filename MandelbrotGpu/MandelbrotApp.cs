@@ -1,5 +1,8 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Numerics;
+using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Windows;
 using System.Windows.Media;
@@ -13,11 +16,13 @@ namespace MandelbrotGpu;
 
 /// <summary>
 /// Main application class: creates a window, manages OpenGL rendering,
-/// handles input, and orchestrates GPU Mandelbrot computation + 3D visualization.
+/// handles input, and orchestrates GPU fractal computation + 3D visualization.
 /// </summary>
 public sealed class MandelbrotApp : IDisposable
 {
     private const int MaxWindowMsaaSamples = 4;
+    private const int RequiredOpenGlMajorVersion = 4;
+    private const int RequiredOpenGlMinorVersion = 3;
     private const int LargeIterationThreshold = 1000;
     private const int IterationLinearStep = 128;
     private const int MaxIterationLimit = 2_000_000;
@@ -36,7 +41,9 @@ public sealed class MandelbrotApp : IDisposable
         new(4096, 2048)
     ];
 
+    private readonly FractalDefinition[] _fractalDefinitions = FractalCatalog.Definitions;
     private readonly Camera _camera = new();
+    private readonly ConcurrentQueue<AppCommand> _pendingCommands = new();
     private readonly string[] _paletteNames = ["Vibrant", "Fire", "Ocean", "Neon"];
     private readonly object _hudWindowLock = new();
 
@@ -55,6 +62,7 @@ public sealed class MandelbrotApp : IDisposable
 
     private PerformanceSettings _performanceSettings;
     private int _resolutionTierIndex;
+    private int _currentFractalIndex;
     private PerformanceMetrics _latestMetrics = PerformanceMetrics.Empty;
     private HeightFieldFrame? _currentFrame;
 
@@ -80,6 +88,14 @@ public sealed class MandelbrotApp : IDisposable
     private Application? _hudApplication;
     private Thread? _hudThread;
     private volatile bool _isHudStarting;
+    private volatile bool _isClosing;
+    private string _glVendor = "Unavailable";
+    private string _glRenderer = "Unavailable";
+    private string _glVersion = "Unavailable";
+    private int _glVersionMajor;
+    private int _glVersionMinor;
+    private InputSource _lastInputSource = InputSource.MainWindow;
+    private string _lastCommandKey = "None";
 
     public MandelbrotApp()
     {
@@ -92,6 +108,12 @@ public sealed class MandelbrotApp : IDisposable
     public PerformanceMetrics LatestPerformanceMetrics => _latestMetrics;
 
     public bool AdaptiveResolutionEnabled => _performanceSettings.AdaptiveResolutionEnabled;
+
+    public FractalDefinition CurrentFractal => _fractalDefinitions[_currentFractalIndex];
+
+    public string CurrentFractalName => CurrentFractal.DisplayName;
+
+    public string CurrentFractalParameterSummary => CurrentFractal.ParameterSummary;
 
     public string CurrentPaletteName => _paletteNames[_currentPalette];
 
@@ -111,6 +133,33 @@ public sealed class MandelbrotApp : IDisposable
 
     public string CurrentPrecisionStatus => _currentFrame?.PrecisionMode ?? _compute?.PrecisionStatus ?? PrecisionMode.Auto.ToString();
 
+    public string BuildDiagnosticSnapshot()
+    {
+        var builder = new StringBuilder();
+        builder.AppendLine($"GL vendor: {_glVendor}");
+        builder.AppendLine($"GL renderer: {_glRenderer}");
+        builder.AppendLine($"GL version: {_glVersion}");
+        builder.AppendLine($"GL version parsed: {_glVersionMajor}.{_glVersionMinor}");
+        builder.AppendLine($"Current fractal: {CurrentFractalName}");
+        builder.AppendLine($"Fractal parameter: {CurrentFractalParameterSummary}");
+        builder.AppendLine($"Performance profile: {_performanceSettings.Profile}");
+        builder.AppendLine($"Precision mode: {CurrentPrecisionMode}");
+        builder.AppendLine($"Precision status: {CurrentPrecisionStatus}");
+        builder.AppendLine($"Compute resolution: {(_compute != null ? $"{_compute.Width} x {_compute.Height}" : "not initialized")}");
+        builder.AppendLine($"Render resolution: {RenderMeshResolution} x {RenderMeshResolution}");
+        builder.AppendLine($"Iterations: {(_compute != null ? _compute.MaxIterations.ToString("N0") : "not initialized")}");
+        builder.AppendLine($"Zoom: {(_compute != null ? _compute.Zoom.ToString("G17") : "not initialized")}");
+        builder.AppendLine($"Center: {(_compute != null ? $"{_compute.CenterX:G17}, {_compute.CenterY:G17}" : "not initialized")}");
+        builder.AppendLine($"Last input source: {_lastInputSource}");
+        builder.AppendLine($"Last command key: {_lastCommandKey}");
+        builder.AppendLine($"Queued external commands: {_pendingCommands.Count}");
+        builder.AppendLine($"Is closing: {_isClosing}");
+        if (_window != null)
+            builder.AppendLine($"Window size: {_window.Size.X} x {_window.Size.Y}");
+
+        return builder.ToString().TrimEnd();
+    }
+
     public void Run()
     {
         _startupLayout = CalculateStartupLayout();
@@ -118,8 +167,13 @@ public sealed class MandelbrotApp : IDisposable
         var options = WindowOptions.Default;
         options.Size = new Vector2D<int>(_startupLayout.MainSize, _startupLayout.MainSize);
         options.Position = new Vector2D<int>(_startupLayout.MainLeft, _startupLayout.MainTop);
-        options.Title = "GPU Mandelbrot 3D Explorer";
+        options.Title = "GPU Fractal 3D Explorer";
         options.VSync = _performanceSettings.VSyncEnabled;
+        options.API = new GraphicsAPI(
+            ContextAPI.OpenGL,
+            ContextProfile.Core,
+            ContextFlags.ForwardCompatible,
+            new APIVersion(RequiredOpenGlMajorVersion, RequiredOpenGlMinorVersion));
         options.PreferredDepthBufferBits = 24;
         options.Samples = MaxWindowMsaaSamples;
 
@@ -136,6 +190,8 @@ public sealed class MandelbrotApp : IDisposable
     private void OnLoad()
     {
         _gl = _window.CreateOpenGL();
+        CaptureGraphicsInfo();
+        ValidateGraphicsCapabilities();
         _input = _window.CreateInput();
 
         _gl.Enable(EnableCap.DepthTest);
@@ -144,6 +200,7 @@ public sealed class MandelbrotApp : IDisposable
         _gl.ClearColor(0.02f, 0.02f, 0.05f, 1.0f);
 
         _compute = new MandelbrotCompute(_gl, _performanceSettings.ComputeResolution, _performanceSettings.ComputeResolution);
+        ApplyFractalDefinition(_currentFractalIndex, logToConsole: false);
         _palette = ColorPalette.GeneratePalette(_currentPalette);
         _paletteCycles = ColorPalette.GetPaletteCycles(_currentPalette);
 
@@ -159,7 +216,7 @@ public sealed class MandelbrotApp : IDisposable
         CreateGridOverlay();
         SetupInput();
         ApplyRuntimePerformanceSettings(logToConsole: false);
-        RecomputeMandelbrot();
+        RecomputeFractal();
         UpdateHudVisibility();
 
         PrintControls();
@@ -218,16 +275,27 @@ public sealed class MandelbrotApp : IDisposable
     private void OnKeyDown(IKeyboard keyboard, Key key, int scancode)
     {
         bool shift = keyboard.IsKeyPressed(Key.ShiftLeft) || keyboard.IsKeyPressed(Key.ShiftRight);
-        HandleKey(key, shift);
+        HandleCommand(new AppCommand(key, shift, InputSource.MainWindow));
     }
 
     public void HandleExternalKeyDown(Key key, bool shiftPressed)
     {
-        HandleKey(key, shiftPressed);
+        if (_isClosing)
+            return;
+
+        _pendingCommands.Enqueue(new AppCommand(key, shiftPressed, InputSource.Hud));
     }
 
-    private void HandleKey(Key key, bool shift)
+    private void HandleCommand(AppCommand command)
     {
+        if (_isClosing)
+            return;
+
+        _lastInputSource = command.Source;
+        _lastCommandKey = command.Key.ToString();
+
+        Key key = command.Key;
+        bool shift = command.Shift;
         double panAmount = shift ? 0.005 : 0.05;
         double zoomFactor = shift ? 1.05 : 1.3;
 
@@ -328,8 +396,13 @@ public sealed class MandelbrotApp : IDisposable
 
             case Key.P:
                 Console.WriteLine(
+                    $"Fractal: {CurrentFractalName} | {CurrentFractalParameterSummary} | " +
                     $"Coords: X: {_compute.CenterX}, Y: {_compute.CenterY} | Zoom: {_compute.Zoom} | Iter: {_compute.MaxIterations} | " +
                     $"Profile: {_performanceSettings.Profile} | Compute: {_compute.Width} | Render: {RenderMeshResolution}");
+                break;
+
+            case Key.T:
+                CycleFractalSet();
                 break;
 
             case Key.V:
@@ -356,13 +429,7 @@ public sealed class MandelbrotApp : IDisposable
                 break;
 
             case Key.R:
-                _compute.CenterX = -0.5;
-                _compute.CenterY = 0.0;
-                _compute.Zoom = 1.0;
-                _compute.MaxIterations = 256;
-                _heightScale = 0.6f;
-                MarkDirty();
-                Console.WriteLine("View reset");
+                ResetCurrentFractalView();
                 break;
 
             case Key.Escape:
@@ -378,18 +445,21 @@ public sealed class MandelbrotApp : IDisposable
         _compute.Zoom = zoom;
         _compute.MaxIterations = maxIterations;
         MarkDirty();
-        Console.WriteLine($"Location set -> X: {centerX}, Y: {centerY} | Zoom: {zoom}x | Iter: {maxIterations}");
+        Console.WriteLine(
+            $"Location set -> {CurrentFractalName} | X: {centerX}, Y: {centerY} | Zoom: {zoom}x | Iter: {maxIterations}");
     }
 
     private void OnUpdate(double deltaTime)
     {
+        DrainPendingCommands();
+
         _frameCount++;
         _fpsTimer += deltaTime;
         if (_fpsTimer >= 1.0)
         {
             _fps = (float)(_frameCount / _fpsTimer);
             _window.Title =
-                $"Mandelbrot 3D | {_fps:F0} FPS | {_performanceSettings.Profile} | Compute {_compute.Width} | Render {RenderMeshResolution} | " +
+                $"{CurrentFractalName} 3D | {_fps:F0} FPS | {_performanceSettings.Profile} | Compute {_compute.Width} | Render {RenderMeshResolution} | " +
                 $"{(_currentFrame?.PrecisionMode ?? _compute.PrecisionStatus)} | Latency {_latestMetrics.InteractionLatencyMs:F1} ms";
             _frameCount = 0;
             _fpsTimer = 0;
@@ -405,11 +475,14 @@ public sealed class MandelbrotApp : IDisposable
             UpdateAdaptiveResolution();
 
         if (_needsRecompute)
-            RecomputeMandelbrot();
+            RecomputeFractal();
     }
 
     private void OnRender(double deltaTime)
     {
+        if (_isClosing)
+            return;
+
         _gl.Clear(ClearBufferMask.ColorBufferBit | ClearBufferMask.DepthBufferBit);
 
         if (_currentFrame == null)
@@ -450,7 +523,7 @@ public sealed class MandelbrotApp : IDisposable
         };
     }
 
-    private void RecomputeMandelbrot()
+    private void RecomputeFractal()
     {
         long recomputeStart = Stopwatch.GetTimestamp();
         long allocatedBefore = GC.GetTotalAllocatedBytes(false);
@@ -471,6 +544,12 @@ public sealed class MandelbrotApp : IDisposable
         };
 
         _needsRecompute = false;
+    }
+
+    private void CycleFractalSet()
+    {
+        int nextIndex = (_currentFractalIndex + 1) % _fractalDefinitions.Length;
+        ApplyFractalDefinition(nextIndex);
     }
 
     private void CyclePerformanceProfile()
@@ -497,6 +576,40 @@ public sealed class MandelbrotApp : IDisposable
 
         MarkDirty();
         Console.WriteLine($"Precision Mode: {_compute.CurrentPrecisionMode}");
+    }
+
+    private void ApplyFractalDefinition(int fractalIndex, bool logToConsole = true)
+    {
+        _currentFractalIndex = fractalIndex;
+        FractalDefinition definition = CurrentFractal;
+
+        _compute.FractalType = definition.Kind;
+        _compute.JuliaConstantX = definition.JuliaConstantX;
+        _compute.JuliaConstantY = definition.JuliaConstantY;
+
+        ResetCurrentFractalView(logToConsole: false);
+
+        if (logToConsole)
+            Console.WriteLine($"Fractal set: {definition.DisplayName} | {definition.ParameterSummary}");
+    }
+
+    private void ResetCurrentFractalView(bool logToConsole = true)
+    {
+        FractalDefinition definition = CurrentFractal;
+
+        _compute.CenterX = definition.DefaultCenterX;
+        _compute.CenterY = definition.DefaultCenterY;
+        _compute.Zoom = definition.DefaultZoom;
+        _compute.MaxIterations = definition.DefaultIterations;
+        _heightScale = definition.DefaultHeightScale;
+        MarkDirty();
+
+        if (logToConsole)
+        {
+            Console.WriteLine(
+                $"View reset -> {definition.DisplayName} | X: {_compute.CenterX}, Y: {_compute.CenterY} | " +
+                $"Zoom: {_compute.Zoom}x | Iter: {_compute.MaxIterations}");
+        }
     }
 
     private void ApplyPerformanceProfile(PerformanceProfile profile)
@@ -615,6 +728,9 @@ public sealed class MandelbrotApp : IDisposable
 
     private void ApplyRuntimePerformanceSettings(bool logToConsole = true)
     {
+        if (_isClosing)
+            return;
+
         if (_window != null)
             _window.VSync = _performanceSettings.VSyncEnabled;
 
@@ -639,7 +755,7 @@ public sealed class MandelbrotApp : IDisposable
 
     private void UpdateHudVisibility()
     {
-        if (_compute == null)
+        if (_isClosing || _compute == null)
             return;
 
         if (_performanceSettings.HudEnabled)
@@ -650,6 +766,9 @@ public sealed class MandelbrotApp : IDisposable
 
     private void FocusHudWindows()
     {
+        if (_isClosing)
+            return;
+
         _performanceSettings = _performanceSettings with { HudEnabled = true };
         ShowHudWindows();
         Console.WriteLine("HUD windows focused");
@@ -657,6 +776,9 @@ public sealed class MandelbrotApp : IDisposable
 
     private void ShowHudWindows()
     {
+        if (_isClosing || _compute == null)
+            return;
+
         lock (_hudWindowLock)
         {
             if (_settingsHud != null && _statusHud != null)
@@ -748,6 +870,9 @@ public sealed class MandelbrotApp : IDisposable
 
     private void CloseHudWindows()
     {
+        if (_isClosing && _hudApplication == null)
+            return;
+
         Application? hudApplication;
         StatusHUD? statusHud;
         SettingsHUD? settingsHud;
@@ -758,7 +883,7 @@ public sealed class MandelbrotApp : IDisposable
             settingsHud = _settingsHud;
         }
 
-        if (hudApplication == null)
+        if (hudApplication == null || hudApplication.Dispatcher.HasShutdownStarted)
             return;
 
         hudApplication.Dispatcher.BeginInvoke(new Action(() =>
@@ -811,11 +936,15 @@ public sealed class MandelbrotApp : IDisposable
 
     private void OnResize(Vector2D<int> size)
     {
+        if (_isClosing)
+            return;
+
         _gl.Viewport(size);
     }
 
     private void OnClosing()
     {
+        _isClosing = true;
         CloseHudWindows();
         _terrainRenderer?.Dispose();
 
@@ -868,6 +997,53 @@ public sealed class MandelbrotApp : IDisposable
     {
         if (location >= 0)
             _gl.UniformMatrix4(location, 1, false, (float*)&matrix);
+    }
+
+    private void DrainPendingCommands()
+    {
+        while (!_isClosing && _pendingCommands.TryDequeue(out AppCommand command))
+            HandleCommand(command);
+    }
+
+    private void CaptureGraphicsInfo()
+    {
+        _glVendor = _gl.GetStringS(StringName.Vendor) ?? "Unavailable";
+        _glRenderer = _gl.GetStringS(StringName.Renderer) ?? "Unavailable";
+        _glVersion = _gl.GetStringS(StringName.Version) ?? "Unavailable";
+
+        try
+        {
+            _gl.GetInteger(GetPName.MajorVersion, out _glVersionMajor);
+            _gl.GetInteger(GetPName.MinorVersion, out _glVersionMinor);
+        }
+        catch
+        {
+            _glVersionMajor = 0;
+            _glVersionMinor = 0;
+        }
+
+        if (_glVersionMajor > 0)
+            return;
+
+        Match versionMatch = Regex.Match(_glVersion, @"(?<major>\d+)\.(?<minor>\d+)");
+        if (versionMatch.Success)
+        {
+            _glVersionMajor = int.Parse(versionMatch.Groups["major"].Value);
+            _glVersionMinor = int.Parse(versionMatch.Groups["minor"].Value);
+        }
+    }
+
+    private void ValidateGraphicsCapabilities()
+    {
+        bool supported = _glVersionMajor > RequiredOpenGlMajorVersion ||
+            (_glVersionMajor == RequiredOpenGlMajorVersion && _glVersionMinor >= RequiredOpenGlMinorVersion);
+
+        if (supported)
+            return;
+
+        throw new InvalidOperationException(
+            $"GPU Fractal 3D Explorer requires an OpenGL {RequiredOpenGlMajorVersion}.{RequiredOpenGlMinorVersion} core context or newer. " +
+            $"Detected {_glVersion} on {_glVendor} / {_glRenderer}.");
     }
 
     private void MarkDirty()
@@ -965,16 +1141,16 @@ public sealed class MandelbrotApp : IDisposable
     {
         Console.WriteLine();
         Console.WriteLine("╔═══════════════════════════════════════════════════════════╗");
-        Console.WriteLine("║              GPU Mandelbrot 3D Explorer                  ║");
+        Console.WriteLine("║                GPU Fractal 3D Explorer                   ║");
         Console.WriteLine("╠═══════════════════════════════════════════════════════════╣");
         Console.WriteLine("║ Mouse: Left drag orbit | Middle drag pan | Wheel zoom    ║");
         Console.WriteLine("║ Move fractal: W/A/S/D or Arrow keys                      ║");
         Console.WriteLine("║ Zoom fractal: +/- (hold Shift for fine control)          ║");
         Console.WriteLine("║ Iterations: I / K                                        ║");
         Console.WriteLine("║ Height scale: PageUp / PageDown                          ║");
-        Console.WriteLine("║ Palette: C | Wireframe: F | Resolution tier: G           ║");
-        Console.WriteLine("║ Precision: M | Profile: N | Shading: L                   ║");
-        Console.WriteLine("║ Adaptive res: O | Focus HUDs: H | VSync: V               ║");
+        Console.WriteLine("║ Fractal set: T | Palette: C | Wireframe: F               ║");
+        Console.WriteLine("║ Resolution tier: G | Precision: M | Profile: N           ║");
+        Console.WriteLine("║ Shading: L | Adaptive res: O | HUDs: H | VSync: V        ║");
         Console.WriteLine("║ Print coords: P                                          ║");
         Console.WriteLine("║ Presets: 1..6 | Reset: R | Exit: Esc                     ║");
         Console.WriteLine("╚═══════════════════════════════════════════════════════════╝");
@@ -983,6 +1159,7 @@ public sealed class MandelbrotApp : IDisposable
 
     public void Dispose()
     {
+        _isClosing = true;
         CloseHudWindows();
         _compute?.Dispose();
         _input?.Dispose();

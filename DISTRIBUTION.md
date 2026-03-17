@@ -1,4 +1,4 @@
-# Distributing Mandelbrot Explorer
+# Distributing Fractal Explorer
 
 The most reliable way to share this application is as a **Self-Contained Folder**. While a single `.exe` is convenient, it often fails with high-performance graphics libraries (Silk.NET/OpenGL) because the native drivers (`glfw3.dll`) cannot be extracted and loaded fast enough from inside the bundle.
 

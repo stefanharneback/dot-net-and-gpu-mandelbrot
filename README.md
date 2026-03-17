@@ -1,6 +1,6 @@
-# 🌀 GPU Mandelbrot 3D Explorer
+# 🌀 GPU Fractal 3D Explorer
 
-A real-time, GPU-accelerated 3D Mandelbrot set visualization built with **.NET 10**, **ILGPU**, and **Silk.NET/OpenGL**.
+A real-time, GPU-accelerated 3D fractal explorer built with **.NET 10**, **ILGPU**, and **Silk.NET/OpenGL**.
 
 ![.NET 10](https://img.shields.io/badge/.NET-10.0-purple)
 ![ILGPU](https://img.shields.io/badge/GPU-ILGPU-green)
@@ -8,21 +8,22 @@ A real-time, GPU-accelerated 3D Mandelbrot set visualization built with **.NET 1
 
 ## Features
 
-- **GPU-Accelerated Computation** — Mandelbrot iteration counts computed massively parallel on your GPU via ILGPU
+- **5 Selectable Fractal Families** — Cycle live between Mandelbrot, Julia, Burning Ship, Tricorn, and Celtic views
+- **GPU-Accelerated Computation** — Iteration counts are computed massively parallel on your GPU for the active fractal formula
 - **Height-Field Terrain Renderer** — A static terrain grid is displaced in the vertex shader from a streamed height texture
 - **GPU-Side Lighting & Palette Lookup** — Normals and palette colors are derived in shaders instead of CPU mesh generation
 - **Performance Profiles** — `Latency`, `Balanced`, `Quality`, and `Screenshot` modes tune compute resolution, render mesh density, shading, HUD, and VSync
 - **Dual HUD Windows** — Separate live-status/performance and controls/settings windows stay readable during exploration
 - **4 Color Palettes** — Vibrant, Fire, Ocean, and Neon palettes tuned for stronger deep-zoom contrast and detail separation
 - **Interactive Camera** — Orbit, zoom, and pan with mouse; navigate the fractal with keyboard
-- **Real-time Fractal Exploration** — Pan and zoom into the Mandelbrot set in real-time
+- **Real-time Fractal Exploration** — Pan and zoom into the active set in real-time
 - **Wireframe Mode** — Toggle wireframe rendering to see the mesh structure
 - **Timing Instrumentation** — Kernel dispatch, GPU sync, readback, texture upload, draw submit, and interaction latency are exposed in the HUD
 
 ## Requirements
 
 - .NET 10 SDK
-- A GPU with OpenGL 3.3+ support (NVIDIA, AMD, or Intel integrated)
+- A GPU with OpenGL 4.3+ support (NVIDIA, AMD, or Intel integrated)
 - ILGPU-compatible GPU for acceleration (falls back to CPU if unavailable)
 
 ## Quick Start
@@ -65,6 +66,7 @@ This is intentionally a wrapper around `dotnet publish MandelbrotGpu/MandelbrotG
 | Increase iterations | `I` |
 | Decrease iterations | `K` |
 | Adjust height scale | `PageUp` / `PageDown` |
+| Cycle fractal set | `T` |
 
 ### 🎨 Display
 | Action | Key |
@@ -87,7 +89,8 @@ This is intentionally a wrapper around `dotnet publish MandelbrotGpu/MandelbrotG
 MandelbrotGpu/
 ├── Program.cs           # Entry point
 ├── MandelbrotApp.cs     # Main application (windowing, rendering, input)
-├── MandelbrotCompute.cs # GPU kernel for Mandelbrot computation (ILGPU)
+├── FractalDefinition.cs # Built-in fractal definitions, Julia constants, and defaults
+├── MandelbrotCompute.cs # GPU compute pipeline for selectable fractal formulas
 ├── HeightFieldRenderer.cs # Static grid renderer + height/palette texture uploads
 ├── TerrainGridCache.cs    # Builds reusable XY terrain grids and index buffers
 ├── HeightFieldFrame.cs    # Compute result + timing metadata for the current height field
@@ -107,5 +110,9 @@ MandelbrotGpu/
 | Runtime | .NET 10 |
 | GPU Compute | ILGPU 1.5.1 |
 | Windowing & OpenGL | Silk.NET 2.22.0 |
-| Shaders | GLSL 330 Core |
+| Shaders | GLSL 430 Core (compute) + 330 Core (render) |
 | Math | System.Numerics |
+
+## Workflow Docs
+
+- Session artifacts for this feature live under [`docs/workflows/`](docs/workflows).

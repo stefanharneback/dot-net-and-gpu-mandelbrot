@@ -218,6 +218,7 @@ public abstract class HudWindowBase : Window
             Key.O => SilkKey.O,
             Key.P => SilkKey.P,
             Key.R => SilkKey.R,
+            Key.T => SilkKey.T,
             Key.V => SilkKey.V,
             Key.PageUp => SilkKey.PageUp,
             Key.PageDown => SilkKey.PageDown,
