@@ -63,6 +63,7 @@ public sealed class MandelbrotApp : IDisposable
     private PerformanceSettings _performanceSettings;
     private int _resolutionTierIndex;
     private int _currentFractalIndex;
+    private int? _currentPresetIndex = 0;
     private PerformanceMetrics _latestMetrics = PerformanceMetrics.Empty;
     private HeightFieldFrame? _currentFrame;
 
@@ -115,6 +116,12 @@ public sealed class MandelbrotApp : IDisposable
 
     public string CurrentFractalParameterSummary => CurrentFractal.ParameterSummary;
 
+    public string CurrentPresetName => _currentPresetIndex is int presetIndex &&
+        presetIndex >= 0 &&
+        presetIndex < CurrentFractal.Presets.Count
+        ? GetPresetLabel(presetIndex)
+        : "Custom view";
+
     public string CurrentPaletteName => _paletteNames[_currentPalette];
 
     public int ComputeResolution => _compute?.Width ?? _performanceSettings.ComputeResolution;
@@ -141,8 +148,11 @@ public sealed class MandelbrotApp : IDisposable
         builder.AppendLine($"GL version: {_glVersion}");
         builder.AppendLine($"GL version parsed: {_glVersionMajor}.{_glVersionMinor}");
         builder.AppendLine($"Current fractal: {CurrentFractalName}");
+        builder.AppendLine($"Current preset: {CurrentPresetName}");
         builder.AppendLine($"Fractal parameter: {CurrentFractalParameterSummary}");
         builder.AppendLine($"Performance profile: {_performanceSettings.Profile}");
+        builder.AppendLine($"Palette: {CurrentPaletteName}");
+        builder.AppendLine($"Height scale: {_heightScale:F2}");
         builder.AppendLine($"Precision mode: {CurrentPrecisionMode}");
         builder.AppendLine($"Precision status: {CurrentPrecisionStatus}");
         builder.AppendLine($"Compute resolution: {(_compute != null ? $"{_compute.Width} x {_compute.Height}" : "not initialized")}");
@@ -304,40 +314,42 @@ public sealed class MandelbrotApp : IDisposable
             case Key.Left:
             case Key.A:
                 _compute.CenterX -= panAmount / _compute.Zoom;
-                MarkDirty();
+                MarkDirty(preservePreset: false);
                 break;
             case Key.Right:
             case Key.D:
                 _compute.CenterX += panAmount / _compute.Zoom;
-                MarkDirty();
+                MarkDirty(preservePreset: false);
                 break;
             case Key.Up:
             case Key.W:
                 _compute.CenterY += panAmount / _compute.Zoom;
-                MarkDirty();
+                MarkDirty(preservePreset: false);
                 break;
             case Key.Down:
             case Key.S:
                 _compute.CenterY -= panAmount / _compute.Zoom;
-                MarkDirty();
+                MarkDirty(preservePreset: false);
                 break;
 
             case Key.Equal:
             case Key.KeypadAdd:
                 _compute.Zoom *= zoomFactor;
-                MarkDirty();
+                MarkDirty(preservePreset: false);
                 break;
             case Key.Minus:
             case Key.KeypadSubtract:
                 _compute.Zoom /= zoomFactor;
-                MarkDirty();
+                MarkDirty(preservePreset: false);
                 break;
 
             case Key.PageUp:
+                MarkPresetCustom();
                 _heightScale = Math.Min(_heightScale + 0.1f, 3.0f);
                 Console.WriteLine($"Height scale: {_heightScale:F2}");
                 break;
             case Key.PageDown:
+                MarkPresetCustom();
                 _heightScale = Math.Max(_heightScale - 0.1f, 0.05f);
                 Console.WriteLine($"Height scale: {_heightScale:F2}");
                 break;
@@ -346,14 +358,14 @@ public sealed class MandelbrotApp : IDisposable
                 _compute.MaxIterations = _compute.MaxIterations < LargeIterationThreshold
                     ? Math.Min(_compute.MaxIterations + IterationLinearStep, MaxIterationLimit)
                     : Math.Min(_compute.MaxIterations * 2, MaxIterationLimit);
-                MarkDirty();
+                MarkDirty(preservePreset: false);
                 Console.WriteLine($"Max iterations: {_compute.MaxIterations:N0}");
                 break;
             case Key.K:
                 _compute.MaxIterations = _compute.MaxIterations <= LargeIterationThreshold
                     ? Math.Max(32, _compute.MaxIterations - IterationLinearStep)
                     : Math.Max(LargeIterationThreshold, _compute.MaxIterations / 2);
-                MarkDirty();
+                MarkDirty(preservePreset: false);
                 Console.WriteLine($"Max iterations: {_compute.MaxIterations:N0}");
                 break;
 
@@ -395,10 +407,7 @@ public sealed class MandelbrotApp : IDisposable
                 break;
 
             case Key.P:
-                Console.WriteLine(
-                    $"Fractal: {CurrentFractalName} | {CurrentFractalParameterSummary} | " +
-                    $"Coords: X: {_compute.CenterX}, Y: {_compute.CenterY} | Zoom: {_compute.Zoom} | Iter: {_compute.MaxIterations} | " +
-                    $"Profile: {_performanceSettings.Profile} | Compute: {_compute.Width} | Render: {RenderMeshResolution}");
+                PrintRuntimeState();
                 break;
 
             case Key.T:
@@ -410,22 +419,22 @@ public sealed class MandelbrotApp : IDisposable
                 break;
 
             case Key.Number1:
-                SetLocation(-0.5, 0.0, 1.0, 256);
+                ApplyPreset(0);
                 break;
             case Key.Number2:
-                SetLocation(-0.743643887037151, 0.13182590420533, 10000.0, 1000);
+                ApplyPreset(1);
                 break;
             case Key.Number3:
-                SetLocation(0.27322626, 0.595153338, 2000.0, 1000);
+                ApplyPreset(2);
                 break;
             case Key.Number4:
-                SetLocation(-0.088, 0.654, 50.0, 500);
+                ApplyPreset(3);
                 break;
             case Key.Number5:
-                SetLocation(-0.7436447860, 0.1318252536, 1000000.0, 2000);
+                ApplyPreset(4);
                 break;
             case Key.Number6:
-                SetLocation(-0.7436447860, 0.1318252536, 100000000000.0, 10000);
+                ApplyPreset(5);
                 break;
 
             case Key.R:
@@ -438,15 +447,27 @@ public sealed class MandelbrotApp : IDisposable
         }
     }
 
-    private void SetLocation(double centerX, double centerY, double zoom, int maxIterations)
+    private void ApplyPreset(int presetIndex, bool logToConsole = true)
     {
-        _compute.CenterX = centerX;
-        _compute.CenterY = centerY;
-        _compute.Zoom = zoom;
-        _compute.MaxIterations = maxIterations;
+        if ((uint)presetIndex >= (uint)CurrentFractal.Presets.Count)
+            return;
+
+        FractalPreset preset = CurrentFractal.Presets[presetIndex];
+        _currentPresetIndex = presetIndex;
+        _compute.CenterX = preset.CenterX;
+        _compute.CenterY = preset.CenterY;
+        _compute.Zoom = preset.Zoom;
+        _compute.MaxIterations = preset.Iterations;
+        _heightScale = preset.HeightScale;
         MarkDirty();
-        Console.WriteLine(
-            $"Location set -> {CurrentFractalName} | X: {centerX}, Y: {centerY} | Zoom: {zoom}x | Iter: {maxIterations}");
+
+        if (logToConsole)
+        {
+            Console.WriteLine(
+                $"Preset {presetIndex + 1}: {preset.Name} -> {CurrentFractalName} | " +
+                $"X: {_compute.CenterX}, Y: {_compute.CenterY} | Zoom: {_compute.Zoom}x | " +
+                $"Iter: {_compute.MaxIterations:N0} | Height: {_heightScale:F2}");
+        }
     }
 
     private void OnUpdate(double deltaTime)
@@ -587,28 +608,21 @@ public sealed class MandelbrotApp : IDisposable
         _compute.JuliaConstantX = definition.JuliaConstantX;
         _compute.JuliaConstantY = definition.JuliaConstantY;
 
-        ResetCurrentFractalView(logToConsole: false);
+        ApplyPreset(0, logToConsole: false);
 
         if (logToConsole)
-            Console.WriteLine($"Fractal set: {definition.DisplayName} | {definition.ParameterSummary}");
+            Console.WriteLine($"Fractal set: {definition.DisplayName} | {CurrentPresetName} | {definition.ParameterSummary}");
     }
 
     private void ResetCurrentFractalView(bool logToConsole = true)
     {
-        FractalDefinition definition = CurrentFractal;
-
-        _compute.CenterX = definition.DefaultCenterX;
-        _compute.CenterY = definition.DefaultCenterY;
-        _compute.Zoom = definition.DefaultZoom;
-        _compute.MaxIterations = definition.DefaultIterations;
-        _heightScale = definition.DefaultHeightScale;
-        MarkDirty();
+        ApplyPreset(0, logToConsole: false);
 
         if (logToConsole)
         {
             Console.WriteLine(
-                $"View reset -> {definition.DisplayName} | X: {_compute.CenterX}, Y: {_compute.CenterY} | " +
-                $"Zoom: {_compute.Zoom}x | Iter: {_compute.MaxIterations}");
+                $"View reset -> {CurrentFractalName} | {CurrentPresetName} | X: {_compute.CenterX}, Y: {_compute.CenterY} | " +
+                $"Zoom: {_compute.Zoom}x | Iter: {_compute.MaxIterations:N0} | Height: {_heightScale:F2}");
         }
     }
 
@@ -1046,8 +1060,29 @@ public sealed class MandelbrotApp : IDisposable
             $"Detected {_glVersion} on {_glVendor} / {_glRenderer}.");
     }
 
-    private void MarkDirty()
+    private void PrintRuntimeState()
     {
+        Console.WriteLine();
+        Console.WriteLine(BuildDiagnosticSnapshot());
+        Console.WriteLine();
+    }
+
+    private string GetPresetLabel(int presetIndex)
+    {
+        FractalPreset preset = CurrentFractal.Presets[presetIndex];
+        return $"{presetIndex + 1}. {preset.Name}";
+    }
+
+    private void MarkPresetCustom()
+    {
+        _currentPresetIndex = null;
+    }
+
+    private void MarkDirty(bool preservePreset = true)
+    {
+        if (!preservePreset)
+            MarkPresetCustom();
+
         _needsRecompute = true;
     }
 
@@ -1139,20 +1174,21 @@ public sealed class MandelbrotApp : IDisposable
 
     private static void PrintControls()
     {
+        const int innerWidth = 57;
+
+        static void WriteControlLine(string text)
+        {
+            const int width = innerWidth;
+            string line = text.Length > width ? text[..width] : text;
+            Console.WriteLine($"║ {line.PadRight(width)} ║");
+        }
+
         Console.WriteLine();
         Console.WriteLine("╔═══════════════════════════════════════════════════════════╗");
         Console.WriteLine("║                GPU Fractal 3D Explorer                   ║");
         Console.WriteLine("╠═══════════════════════════════════════════════════════════╣");
-        Console.WriteLine("║ Mouse: Left drag orbit | Middle drag pan | Wheel zoom    ║");
-        Console.WriteLine("║ Move fractal: W/A/S/D or Arrow keys                      ║");
-        Console.WriteLine("║ Zoom fractal: +/- (hold Shift for fine control)          ║");
-        Console.WriteLine("║ Iterations: I / K                                        ║");
-        Console.WriteLine("║ Height scale: PageUp / PageDown                          ║");
-        Console.WriteLine("║ Fractal set: T | Palette: C | Wireframe: F               ║");
-        Console.WriteLine("║ Resolution tier: G | Precision: M | Profile: N           ║");
-        Console.WriteLine("║ Shading: L | Adaptive res: O | HUDs: H | VSync: V        ║");
-        Console.WriteLine("║ Print coords: P                                          ║");
-        Console.WriteLine("║ Presets: 1..6 | Reset: R | Exit: Esc                     ║");
+        foreach (string line in HotkeyBindings.ConsoleLegendLines)
+            WriteControlLine(line);
         Console.WriteLine("╚═══════════════════════════════════════════════════════════╝");
         Console.WriteLine();
     }

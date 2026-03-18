@@ -2,7 +2,7 @@ using System.Windows;
 using MandelbrotGpu;
 
 Console.WriteLine("🌀 Starting GPU Fractal 3D Explorer...");
-Console.WriteLine("   Built with .NET 10 + ILGPU + Silk.NET/OpenGL");
+Console.WriteLine("   Built with .NET 10 + Silk.NET + OpenGL Compute Shaders");
 Console.WriteLine();
 
 using var app = new MandelbrotApp();

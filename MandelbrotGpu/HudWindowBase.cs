@@ -192,47 +192,7 @@ public abstract class HudWindowBase : Window
 
     private void OnHudKeyDown(object sender, KeyEventArgs e)
     {
-        SilkKey mappedKey = e.Key switch
-        {
-            Key.W => SilkKey.W,
-            Key.A => SilkKey.A,
-            Key.S => SilkKey.S,
-            Key.D => SilkKey.D,
-            Key.Up => SilkKey.Up,
-            Key.Down => SilkKey.Down,
-            Key.Left => SilkKey.Left,
-            Key.Right => SilkKey.Right,
-            Key.Add => SilkKey.KeypadAdd,
-            Key.OemPlus => SilkKey.Equal,
-            Key.Subtract => SilkKey.KeypadSubtract,
-            Key.OemMinus => SilkKey.Minus,
-            Key.I => SilkKey.I,
-            Key.K => SilkKey.K,
-            Key.C => SilkKey.C,
-            Key.F => SilkKey.F,
-            Key.G => SilkKey.G,
-            Key.H => SilkKey.H,
-            Key.L => SilkKey.L,
-            Key.M => SilkKey.M,
-            Key.N => SilkKey.N,
-            Key.O => SilkKey.O,
-            Key.P => SilkKey.P,
-            Key.R => SilkKey.R,
-            Key.T => SilkKey.T,
-            Key.V => SilkKey.V,
-            Key.PageUp => SilkKey.PageUp,
-            Key.PageDown => SilkKey.PageDown,
-            Key.D1 => SilkKey.Number1,
-            Key.D2 => SilkKey.Number2,
-            Key.D3 => SilkKey.Number3,
-            Key.D4 => SilkKey.Number4,
-            Key.D5 => SilkKey.Number5,
-            Key.D6 => SilkKey.Number6,
-            Key.Escape => SilkKey.Escape,
-            _ => SilkKey.Unknown
-        };
-
-        if (mappedKey == SilkKey.Unknown)
+        if (!HotkeyBindings.TryMapHudKey(e.Key, out SilkKey mappedKey))
             return;
 
         _app.HandleExternalKeyDown(mappedKey, Keyboard.Modifiers.HasFlag(ModifierKeys.Shift));
